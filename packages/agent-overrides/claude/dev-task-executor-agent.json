@@ -1,0 +1,6 @@
+{
+  "frontmatter": {
+    "description": "开发任务执行专家。输入为明确的开发任务与检查标准；先理解任务并从 specrules/rules/index.md 依次加载前置基础层、当前阶段规则和横切专题规则，按规范完成实现与本地自检，然后向 feature-dev-manager-agent 回报结构化结果。在收到带任务描述与验收标准时主动使用。",
+    "tools": "Glob, Grep, LS, Read, Write, Edit, Bash, NotebookRead, WebFetch, TodoWrite, WebSearch"
+  }
+}

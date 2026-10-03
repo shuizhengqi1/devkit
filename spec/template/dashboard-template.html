@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>devkit-flow 过程看板</title>
+<!--
+  过程态 dashboard 模板第二版（009-dashboard-revamp 返工批次 T11：亮/暗双主题 app-shell，
+  视觉基准 demo-dashboard-v2.html，设计文档 §4.2–§4.7）。
+  渲染契约：18 个大写双花括号 TOKEN 标量占位（PROGRESS_PERCENT 出现两次：进度轨宽度 + 百分数文本）
+  + 16 个 AGENT_INJECT 块注入点（接口文档 §4 修订版）；渲染方（dashboard.py render_dashboard）
+  必须替换全部占位与注入点，渲染后残留双花括号即视为失败。
+  模板改动需同步 dashboard.py 的 tokens / injects 清单与三处守卫测试
+  （test_devkit_flow_dashboard.py / test_devkit_flow_bundle.py / test_devkit_flow_feature_init.py）。
+  localStorage 键契约（接口文档 §5，5 键）：devkitDashboard:theme（全局，light|dark|auto）；
+  devkitDashboard:{FEATURE_NAME}:doc（阅读视图文件名，总览写空串）/ :open / :scroll
+  / :depH（依赖图锁高，T12 用户验收变更）。
+  刷新为交互感知三重跳过（T12 用户验收变更，设计 §4.5）：document.hidden /
+  阅读视图打开 / 交互后 10s 内，均跳过本轮 reload；详见 tick 注释。
+  details 稳定标识 data-key 本版仅余 clamp:{ID}:{字段}（D-4）；文档打开与恢复一律按
+  template/导航项的 data-doc 文件名寻址（非顺序索引）。
+-->
+<script>
+  // 早绘主题同步（P3 减闪烁三件套之一）：<head> 内同步执行，在样式生效前置 data-theme，
+  // reload 首帧背景即为目标主题色；键与主脚本 THEME_KEY 同源（devkitDashboard:theme 全局键）。
+  (function () {
+    var mode = 'auto';
+    try { mode = window.localStorage.getItem('devkitDashboard:theme') || 'auto'; } catch (e) {}
+    var dark = mode === 'dark' || (mode !== 'light' &&
+      window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  })();
+</script>
+<style>
+:root{
+  --bg:#F3F5F8; --panel:#FFFFFF; --raise:#EEF1F5; --line:#DDE3EA; --line-soft:#E7EBF0;
+  --ink:#1E2833; --ink2:#5B6B7D; --ink3:#93A1B0;
+  --acc:#2E7CD6; --acc-dim:#8FBCE8;
+  --ok:#199D66; --warn:#C77F14; --bad:#D64545; --skip:#93A1B0;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+}
+html[data-theme="dark"]{
+  --bg:#131A24; --panel:#1B2430; --raise:#232E3D; --line:#2C3949; --line-soft:#233042;
+  --ink:#E3EAF3; --ink2:#8FA1B5; --ink3:#5C6F84;
+  --acc:#53B1FD; --acc-dim:#2A5F8F;
+  --ok:#34C088; --warn:#F0B03F; --bad:#F26D6D; --skip:#5C6F84;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:var(--bg)}
+body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13.5px;line-height:1.6}
+a{color:var(--acc);text-underline-offset:2px}
+code{font-family:var(--mono);font-size:.86em;background:var(--raise);border:1px solid var(--line);border-radius:4px;padding:.05em .35em}
+.app{display:flex;min-height:100vh}
+
+/* ───── 左侧栏 ───── */
+.side{width:242px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:18px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+.brand{padding:0 18px 4px;font-family:var(--mono);font-size:15px;font-weight:700;letter-spacing:.2px;overflow-wrap:anywhere}
+.live{padding:2px 18px 12px;font-family:var(--mono);font-size:11px;color:var(--ink2)}
+.live .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:6px;animation:pulse 2.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media(prefers-reduced-motion:reduce){.live .dot,.bp-dot{animation:none}}
+.theme-toggle{margin:0 18px 10px;display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;font-size:11px}
+.theme-toggle button{border:0;background:var(--panel);color:var(--ink2);padding:3px 12px;cursor:pointer;font-family:var(--mono)}
+.theme-toggle button.on{background:var(--raise);color:var(--ink)}
+.nav{padding:4px 10px}
+.nav-title{padding:14px 8px 4px;font-size:11px;color:var(--ink3);letter-spacing:.08em}
+.nav a{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;color:var(--ink2);text-decoration:none;font-size:12.5px;cursor:pointer;border:1px solid transparent}
+.nav a:hover{background:var(--raise);color:var(--ink)}
+.nav a.active{background:var(--raise);color:var(--ink);border-color:var(--line)}
+.nav a .fico{font-family:var(--mono);font-size:10px;color:var(--ink3);width:26px;flex:none;text-align:center;border:1px solid var(--line);border-radius:4px;padding:0 2px}
+.nav a.active .fico{color:var(--acc);border-color:var(--acc-dim)}
+.nav a .fn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ───── 主区（自适应宽度：无固定 max-width，宽内容仅容器内横滚） ───── */
+.main{flex:1;min-width:0;padding:22px 28px 60px}
+
+/* 流水线轨道：横向阶段 stepper = 总进度条 */
+.railbox{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 22px 16px;margin-bottom:18px}
+.rail-top{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 14px;margin-bottom:6px}
+.rail-top h1{font-size:16px;font-weight:600}
+.rail-status{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600}
+.rail-status .overall{font-weight:700}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--ink3);flex:none}
+.dot.k-blocked{background:var(--bad)}
+.dot.k-waiting{background:var(--warn)}
+.dot.k-running{background:var(--acc)}
+.dot.k-gate-missing{background:var(--warn)}
+.dot.k-attention{background:var(--warn)}
+.dot.k-done{background:var(--ok)}
+.rail-top .total{font-family:var(--mono);font-size:12px;color:var(--ink2)}
+.rail-top .total b{font-size:18px;color:var(--ink);font-weight:700}
+.rail{position:relative;height:4px;background:var(--line-soft);border-radius:2px;margin:14px 8px 0}
+.rail-fill{position:absolute;left:0;top:0;height:4px;border-radius:2px;background:linear-gradient(90deg,var(--ok),var(--acc));max-width:100%}
+.stages{display:flex;margin-top:-9px}
+.stage-seg{flex:1;text-align:center;cursor:pointer}
+.stage-seg .node{width:14px;height:14px;border-radius:50%;margin:0 auto;background:var(--panel);border:2px solid var(--ink3);position:relative;z-index:1}
+.stage-seg.done .node{background:var(--ok);border-color:var(--ok)}
+.stage-seg.run .node{background:var(--acc);border-color:var(--acc);box-shadow:0 0 0 4px rgba(83,177,253,.18)}
+.stage-seg .s-name{margin-top:8px;font-size:13px;font-weight:600}
+.stage-seg .s-cnt{font-family:var(--mono);font-size:11px;color:var(--ink2)}
+.stage-seg.run .s-name{color:var(--acc)}
+.stage-seg.pend .s-name{color:var(--ink3)}
+.rail-meta{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:12px;font-size:12px;color:var(--ink2)}
+.rail-meta b{color:var(--ink);font-weight:600}
+
+/* 断点卡（整块注入，空态整卡隐藏） */
+.bp{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:10px;padding:13px 18px;margin-bottom:18px}
+.bp-dot{width:9px;height:9px;border-radius:50%;background:var(--acc);flex:none;animation:pulse 2.4s infinite}
+.bp b{font-family:var(--mono)}
+.bp .next{color:var(--ink2);font-size:12.5px;margin-left:auto;text-align:right}
+
+/* 等待区块 / 卡点面板（整块注入，空态整段隐藏） */
+section.waiting,section.blockers{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-bottom:16px}
+section.waiting h2,section.blockers h2{font-size:13.5px;margin-bottom:4px}
+section.waiting ul{padding-left:18px;color:var(--ink2)}
+p.desc{color:var(--ink2);font-size:12px}
+.brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:8px}
+.brief-box{border:1px solid var(--line);background:var(--raise);border-radius:8px;padding:10px 12px}
+.brief-box h3{font-size:13px;margin-bottom:4px}
+.brief-box ul{padding-left:18px;color:var(--ink2)}
+.brief-box li{padding:1px 0}
+
+/* 阶段明细 */
+section.block{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:16px;overflow:hidden}
+section.block>header{padding:12px 18px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line-soft)}
+section.block>header h2{font-size:13.5px;font-weight:600}
+section.block>header .cnt{font-family:var(--mono);font-size:11px;color:var(--ink2);margin-left:auto}
+section.block h3{font-size:12px;color:var(--ink3);padding:10px 18px 0;letter-spacing:.05em}
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:7px 14px;text-align:left;border-bottom:1px solid var(--line-soft);vertical-align:top}
+th{color:var(--ink3);font-weight:500;font-size:11.5px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.id{font-family:var(--mono);font-weight:600;white-space:nowrap}
+td.note{color:var(--ink2);min-width:200px}
+.gate{padding:0 18px 14px}
+.gate p{margin-top:6px}
+.gate ul{padding-left:18px;color:var(--ink2)}
+
+/* 状态圆点 + 同色小字（步骤表，DASHBOARD_STATE_CLASSES 契约） */
+.st{display:inline-flex;align-items:center;gap:6px;font-size:12px;white-space:nowrap}
+.st i{width:8px;height:8px;border-radius:50%;flex:none}
+.st.done i{background:var(--ok)} .st.done{color:var(--ok)}
+.st.run i{background:var(--acc)} .st.run{color:var(--acc)}
+.st.wait i{background:var(--warn)} .st.wait{color:var(--warn)}
+.st.pend i{background:transparent;border:1.5px solid var(--ink3)} .st.pend{color:var(--ink3)}
+.st.skip i{background:var(--skip)} .st.skip{color:var(--skip)}
+.st.blocked i{background:var(--bad)} .st.blocked{color:var(--bad)}
+.st.waived i{background:var(--warn)} .st.waived{color:var(--warn)}
+
+/* 状态 pill（任务表 / e2e 门沿用既有 .pill.st-* 渲染契约，主题变量化） */
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;white-space:nowrap;color:var(--ink2)}
+.pill::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--ink3);flex:none}
+.pill.st-done{color:var(--ok)}
+.pill.st-done::before{background:var(--ok)}
+.pill.st-in-progress{color:var(--acc)}
+.pill.st-in-progress::before{background:var(--acc)}
+.pill.st-waiting-confirmation{color:var(--warn)}
+.pill.st-waiting-confirmation::before{background:var(--warn)}
+.pill.st-blocked{color:var(--bad)}
+.pill.st-blocked::before{background:var(--bad)}
+.pill.st-pending{color:var(--ink3)}
+.pill.st-pending::before{background:transparent;border:1.5px solid var(--ink3)}
+.pill.st-skipped{color:var(--skip)}
+.pill.st-skipped::before{background:var(--skip)}
+.pill.st-waived{color:var(--warn)}
+.pill.st-waived::before{background:var(--warn)}
+
+/* 长文折叠（data-key=clamp:*，展开态跨 reload 保持，D-4） */
+details.clamp{display:inline}
+details.clamp>summary{cursor:pointer;list-style:none;color:inherit}
+details.clamp>summary::-webkit-details-marker{display:none}
+details.clamp>summary::after{content:" \2026\5C55\5F00";color:var(--acc);font-size:12px}
+details.clamp[open]>summary{display:none}
+
+/* 依赖图与 mermaid（容器内横滚，主题联动重渲） */
+.dep{padding:14px 18px;overflow-x:auto}
+pre.mermaid{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;overflow:auto;font-size:13px;line-height:1.5;color:var(--ink)}
+pre.mermaid.mermaid-error{border-color:var(--bad)}
+pre.mermaid svg{max-width:100%}
+
+/* 文档阅读视图 */
+.doc-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.doc-head .back{cursor:pointer;color:var(--acc);font-size:12.5px;border:1px solid var(--line);border-radius:6px;padding:4px 12px;background:var(--panel)}
+.doc-head .back:hover{background:var(--raise)}
+.doc-head h1{font-family:var(--mono);font-size:15px;overflow-wrap:anywhere}
+.doc-body{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px 36px}
+.md{font-size:14px;line-height:1.7}
+.md h1{font-size:22px;margin:1.3em 0 .55em}
+.md h2{font-size:18px;margin:1.25em 0 .45em}
+.md h3{font-size:16px;margin:1.15em 0 .4em;color:var(--ink);padding:0;letter-spacing:0}
+.md h4,.md h5,.md h6{font-size:15px;margin:1.05em 0 .35em;color:var(--ink2)}
+.md h1:first-child,.md h2:first-child{margin-top:0}
+.md p{margin:0 0 .9em;overflow-wrap:anywhere}
+.md a{color:var(--acc);text-decoration:none}
+.md a:hover{text-decoration:underline}
+.md ul,.md ol{margin:0 0 1em;padding-left:1.4em}
+.md li{margin:.25em 0}
+.md hr{border:0;border-top:1px solid var(--line);margin:1.3em 0}
+.md pre{overflow:auto;padding:14px 16px;background:var(--raise);border:1px solid var(--line);border-radius:8px;font-family:var(--mono);font-size:13px;margin:0 0 1em}
+.md pre code{background:none;border:0;padding:0}
+.md .table-wrap{overflow-x:auto;margin:0 0 1.1em}
+.md table{width:100%;border-collapse:collapse;font-size:13.5px}
+.md th,.md td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+.md table th:first-child,.md table td:first-child{white-space:nowrap}
+.md th{background:var(--raise);color:var(--ink2)}
+.md blockquote{margin:0 0 1em;padding:2px 0 2px 12px;border-left:3px solid var(--line);color:var(--ink2)}
+.md pre.mermaid{background:var(--panel)}
+
+/* 宽表卡片化（render_markdown_subset wide_table_cards=True 输出，类名与 demo 一致） */
+.recs{display:flex;flex-direction:column;gap:10px;margin:0 0 1.1em}
+.rec{border:1px solid var(--line);border-radius:10px;background:var(--panel);padding:12px 16px}
+.rec-head{font-family:var(--mono);font-weight:700;font-size:13.5px;margin-bottom:6px;color:var(--acc)}
+.rec-field{display:flex;gap:10px;padding:3px 0;font-size:13px}
+.rec-k{flex:none;width:88px;color:var(--ink3);font-size:12px;padding-top:1px}
+.rec-v{min-width:0;color:var(--ink2);overflow-wrap:anywhere}
+
+footer{color:var(--ink3);font-size:11.5px;font-family:var(--mono);margin-top:22px}
+@media(max-width:900px){.side{display:none}.main{padding:14px}}
+</style>
+</head>
+<body data-report-layout="dashboard-v2" data-feature="{{FEATURE_NAME}}">
+<div class="app">
+
+<aside class="side">
+  <div class="brand" id="brand-name">过程看板</div>
+  <!-- S5.7 I-3：初始文案取中性值（JS 整体失败/GENERATED_AT 不可解析时不得恒显乐观默认文案形成假 LIVE），由 updateLive 覆盖 -->
+  <div class="live"><span class="dot"></span>LIVE · <span id="live-interval">-</span> · <span id="live-ago">加载中…</span></div>
+  <div class="theme-toggle"><button id="th-light" onclick="setTheme('light')">亮</button><button id="th-dark" onclick="setTheme('dark')">暗</button><button id="th-auto" onclick="setTheme('auto')">跟随系统</button></div>
+  <nav class="nav" id="doc-nav">
+<!-- AGENT_INJECT: sidebar doc nav -->
+  </nav>
+</aside>
+
+<main class="main">
+
+  <!-- 总览视图 -->
+  <div id="view-overview">
+    <div class="railbox">
+      <div class="rail-top">
+        <h1>{{FEATURE_TITLE}} · 流水线</h1>
+        <div class="rail-status"><span class="dot k-{{OVERALL_STATUS_KIND}}"></span><span class="overall">{{OVERALL_STATUS}}</span></div>
+        <div class="total">{{PROGRESS_SUMMARY}} · <b>{{PROGRESS_PERCENT}}%</b></div>
+      </div>
+      <div class="rail"><div class="rail-fill" style="width:{{PROGRESS_PERCENT}}%"></div></div>
+      <div class="stages">
+<!-- AGENT_INJECT: pipeline rail stages -->
+      </div>
+      <div class="rail-meta">
+        <span>登记状态 <b>{{FEATURE_STATE}}</b></span>
+        <span>规模 <b>{{FEATURE_SCALE}}</b></span>
+        <span>模式 <b>{{FEATURE_MODE}}</b></span>
+        <span>分支 <b>{{FEATURE_BRANCH}}</b></span>
+        <span>ONES 需求 {{ONES_REQUIREMENT}}</span>
+      </div>
+    </div>
+
+<!-- AGENT_INJECT: breakpoint card -->
+
+<!-- AGENT_INJECT: status waiting block -->
+
+    <section class="block" id="stg-requirement">
+      <header><h2>需求</h2><span class="cnt">{{STAGE_REQUIREMENT_PROGRESS}}</span></header>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>名称</th><th>状态</th><th>开始</th><th>耗时</th><th>备注</th></tr></thead>
+          <tbody><!-- AGENT_INJECT: stage requirement step rows --></tbody>
+        </table>
+      </div>
+      <!-- AGENT_INJECT: stage requirement task block -->
+    </section>
+
+    <section class="block" id="stg-development">
+      <header><h2>开发</h2><span class="cnt">{{STAGE_DEVELOPMENT_PROGRESS}}</span></header>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>名称</th><th>状态</th><th>开始</th><th>耗时</th><th>备注</th></tr></thead>
+          <tbody><!-- AGENT_INJECT: stage development step rows --></tbody>
+        </table>
+      </div>
+      <!-- AGENT_INJECT: stage development task block -->
+    </section>
+
+    <section class="block" id="stg-testing">
+      <header><h2>测试</h2><span class="cnt">{{STAGE_TESTING_PROGRESS}}</span></header>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>名称</th><th>状态</th><th>开始</th><th>耗时</th><th>备注</th></tr></thead>
+          <tbody><!-- AGENT_INJECT: stage testing step rows --></tbody>
+        </table>
+      </div>
+      <!-- AGENT_INJECT: stage testing task block -->
+      <h3>e2e 准出门</h3>
+      <div class="gate"><!-- AGENT_INJECT: stage testing e2e gate --></div>
+    </section>
+
+    <section class="block" id="stg-review">
+      <header><h2>审查</h2><span class="cnt">{{STAGE_REVIEW_PROGRESS}}</span></header>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>名称</th><th>状态</th><th>开始</th><th>耗时</th><th>备注</th></tr></thead>
+          <tbody><!-- AGENT_INJECT: stage review step rows --></tbody>
+        </table>
+      </div>
+      <!-- AGENT_INJECT: stage review task block -->
+    </section>
+
+<!-- AGENT_INJECT: blockers panel -->
+
+    <section class="block deps">
+      <header><h2>依赖图</h2><span class="cnt">graph TD · 四大阶段分组</span></header>
+      <div class="dep"><pre class="mermaid" id="dep-graph"><!-- AGENT_INJECT: dependency graph --></pre></div>
+    </section>
+  </div>
+
+  <!-- 文档阅读视图（与总览互斥，按 data-doc 文件名寻址） -->
+  <div id="view-doc" hidden>
+    <div class="doc-head">
+      <span class="back" onclick="showOverview()">← 返回总览</span>
+      <h1 id="doc-title"></h1>
+    </div>
+    <div class="doc-body" id="doc-body"></div>
+  </div>
+
+  <footer>Generated by <strong>devkit-flow flow dashboard</strong> · <span id="generated-at">{{GENERATED_AT}}</span> · <span id="refreshNote">自动刷新已启用</span></footer>
+</main>
+</div>
+
+<!-- AGENT_INJECT: doc templates -->
+
+<script src="{{MERMAID_SRC}}"></script>
+<script>
+  var REFRESH_INTERVAL_MS = {{REFRESH_INTERVAL_MS}};
+  var DASH_FEATURE = document.body.getAttribute('data-feature') || '';
+  var THEME_KEY = 'devkitDashboard:theme';
+  var DOC_KEY = 'devkitDashboard:' + DASH_FEATURE + ':doc';
+  var OPEN_KEY = 'devkitDashboard:' + DASH_FEATURE + ':open';
+  var SCROLL_KEY = 'devkitDashboard:' + DASH_FEATURE + ':scroll';
+  // T12 验收追加（用户验收变更）：依赖图锁高键（接口文档 §5 第 5 键）。
+  var DEPH_KEY = 'devkitDashboard:' + DASH_FEATURE + ':depH';
+  var currentDoc = '';
+  var depSource = '';
+  var depTheme = null;
+  var generatedMs = NaN;
+  // T12 验收追加（用户验收变更）：交互感知刷新——最近交互时间戳与暂停窗口。
+  // 模板局部定值（非渲染 TOKEN，18 token 契约不变）；loadedAt 用于豁免加载后 1s
+  // 内的事件（restoreState 程序化 scrollTo 触发的 scroll 不计交互）。
+  var lastInteraction = 0;
+  var loadedAt = Date.now();
+  var INTERACTION_PAUSE_MS = 10000;
+
+  // localStorage 全部读写 try/catch 包裹：file:// 下 storage 不可用时静默降级——
+  // 刷新照常、状态不保持、主题回落跟随系统（接口文档 §5 / RK2）。
+  function lsGet(key) { try { return window.localStorage.getItem(key); } catch (e) { return null; } }
+  function lsSet(key, value) { try { window.localStorage.setItem(key, value); } catch (e) {} }
+
+  function themeMode() { return lsGet(THEME_KEY) || 'auto'; }
+  function isDark(mode) {
+    return mode === 'dark' || (mode !== 'light' &&
+      window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  function themeName() {
+    return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  }
+  function applyTheme(mode) {
+    var prev = themeName();
+    var next = isDark(mode) ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    ['light', 'dark', 'auto'].forEach(function (key) {
+      var button = document.getElementById('th-' + key);
+      if (button) { button.classList.toggle('on', key === mode); }
+    });
+    // 切主题重渲当前视图 mermaid（theme default/dark 联动，从 template/源码重取重放）。
+    if (prev !== next) { rerenderMermaid(); }
+  }
+  function setTheme(mode) { lsSet(THEME_KEY, mode); applyTheme(mode); }
+
+  function mermaidInit() {
+    if (!window.mermaid || !mermaid.initialize) { return false; }
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      theme: themeName() === 'dark' ? 'dark' : 'default',
+      flowchart: { useMaxWidth: true, htmlLabels: false }
+    });
+    return Boolean(mermaid.run);
+  }
+  function runMermaid(nodes) {
+    // 无条件先 initialize（review-arch-batch6 W-1）：mermaid 资产 startOnLoad 库默认
+    // 为 true，若因当前视图无图而跳过 initialize，window load 时 mermaid 会以默认亮
+    // 主题自动渲染隐藏的 #dep-graph（暗主题错色）；mermaidInit 内 startOnLoad:false
+    // 关闭 auto-run。曾有的 window.mermaid={startOnLoad:false} 预置 script 会被资产
+    // 末尾的 globalThis.mermaid 赋值整体覆盖、实际无效，已删除勿回加。
+    // MERMAID_SRC 为空（随包资产缺失）时 window.mermaid 不存在，mermaidInit 返回
+    // false：降级保留 mermaid 源码文本展示，不阻断页面（Q7）。
+    if (!mermaidInit() || !nodes.length) { return; }
+    // T12 验收追加：返回 run promise，供依赖图锁高在渲染完成后量高写回（短路路径
+    // 返回 undefined，调用方判 then 兼容）。
+    return mermaid.run({ nodes: nodes }).catch(function () {
+      nodes.forEach(function (node) { node.classList.add('mermaid-error'); });
+    });
+  }
+  function renderOverviewMermaid() {
+    var node = document.getElementById('dep-graph');
+    if (!node) { return; }
+    // T12 验收追加（用户验收变更）：依赖图锁高——渲染前先用上轮存高（DEPH_KEY）
+    // 设 min-height，减少 reload 时源码文本→SVG 的高度跳变；渲染完成后量实际高度
+    // 写回并更新 min-height。lsGet/lsSet 自带 try/catch，storage 不可用静默降级。
+    var savedH = parseFloat(lsGet(DEPH_KEY));
+    if (!isNaN(savedH) && savedH > 0) { node.style.minHeight = savedH + 'px'; }
+    node.textContent = depSource; // mermaid 渲染会替换节点内容，重渲需回放原始源码
+    node.removeAttribute('data-processed');
+    depTheme = themeName();
+    var done = runMermaid([node]);
+    if (done && done.then) {
+      done.then(function () {
+        var h = node.offsetHeight;
+        if (h > 0) { lsSet(DEPH_KEY, String(h)); node.style.minHeight = h + 'px'; }
+      });
+    }
+  }
+  function renderDocMermaid() {
+    runMermaid(Array.prototype.slice.call(document.querySelectorAll('#doc-body pre.mermaid')));
+  }
+  function rerenderMermaid() {
+    // 阅读视图：重新注入 template 原文再渲染（openDoc 内部完成）；总览：重放依赖图源码。
+    if (currentDoc) { openDoc(currentDoc); } else { renderOverviewMermaid(); }
+  }
+
+  function docTemplate(name) {
+    var templates = document.querySelectorAll('template[data-doc]');
+    for (var index = 0; index < templates.length; index++) {
+      if (templates[index].getAttribute('data-doc') === name) { return templates[index]; }
+    }
+    return null;
+  }
+  function syncNav(name) {
+    Array.prototype.forEach.call(document.querySelectorAll('.nav a[data-doc]'), function (link) {
+      link.classList.toggle('active', link.getAttribute('data-doc') === name);
+    });
+  }
+  function openDoc(name) {
+    var template = docTemplate(name);
+    if (!template) { showOverview(); return; } // 文档被移除/未内嵌：静默回总览（接口文档 §5）
+    currentDoc = name;
+    document.getElementById('doc-title').textContent = name;
+    document.getElementById('doc-body').innerHTML = template.innerHTML;
+    document.getElementById('view-overview').hidden = true;
+    document.getElementById('view-doc').hidden = false;
+    syncNav(name);
+    lsSet(DOC_KEY, name);
+    renderDocMermaid();
+  }
+  function showOverview(skipCatchUp) {
+    currentDoc = '';
+    document.getElementById('view-doc').hidden = true;
+    document.getElementById('view-overview').hidden = false;
+    syncNav('');
+    lsSet(DOC_KEY, ''); // 总览写空串（单一口径，不使用 removeItem）
+    // T12 验收追加（用户验收变更）：阅读期间 tick 跳过 reload，回总览时若页面数据
+    // 已陈旧（GENERATED_AT 距今超过一个刷新周期）立即补一次 reload 追平——主动视图
+    // 切换点，交互 10s 窗口不适用；R6 跳转路径（jump）传 skipCatchUp=true 走原路径，
+    // 避免 scrollIntoView 被 reload 吞掉。DOC_KEY 已写空串，reload 后 restoreState
+    // 直接回总览，无循环。
+    if (!skipCatchUp && !isNaN(generatedMs) && Date.now() - generatedMs > REFRESH_INTERVAL_MS) {
+      saveState();
+      location.reload();
+      return;
+    }
+    // 在阅读视图中切过主题：返回总览时按当前主题补渲依赖图；depTheme 为 null
+    // （reload 直入阅读视图、依赖图从未渲染过）时也补渲（T12 验收追加）。
+    if (depTheme === null || depTheme !== themeName()) { renderOverviewMermaid(); }
+  }
+  function jump(id) {
+    if (currentDoc) { showOverview(true); } // 阅读视图下先切回总览再跳转（R6，跳过补刷）
+    var el = document.getElementById(id);
+    if (!el) { return; }
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    el.style.transition = 'box-shadow .3s';
+    el.style.boxShadow = '0 0 0 2px var(--acc)';
+    setTimeout(function () { el.style.boxShadow = 'none'; }, 1200);
+  }
+
+  function allKeyedDetails() {
+    return Array.prototype.slice.call(document.querySelectorAll('details[data-key]'));
+  }
+  function saveState() {
+    var open = [];
+    allKeyedDetails().forEach(function (node) {
+      if (node.open) { open.push(node.getAttribute('data-key')); }
+    });
+    lsSet(OPEN_KEY, JSON.stringify(open));
+    lsSet(SCROLL_KEY, String(window.scrollY || 0));
+    lsSet(DOC_KEY, currentDoc);
+  }
+  function restoreState() {
+    var doc = lsGet(DOC_KEY);
+    if (doc) { openDoc(doc); } // data-doc 文件名寻址；不存在时 openDoc 内部静默回总览
+    var raw = lsGet(OPEN_KEY);
+    if (raw !== null) {
+      var open = [];
+      try { open = JSON.parse(raw) || []; } catch (e) { open = []; }
+      // D-6 守卫（T4 审查 W-1 延续）：合法 JSON 但非数组的畸形值忽略并继续——不得中断
+      // DOMContentLoaded 回调，刷新定时器必须照常安装。
+      if (!Array.isArray(open)) { open = []; }
+      // 语义派生标识（本版仅余 clamp:*）：存储中不存在于新页面的键静默忽略。
+      allKeyedDetails().forEach(function (node) {
+        node.open = open.indexOf(node.getAttribute('data-key')) !== -1;
+      });
+    }
+    var scroll = parseFloat(lsGet(SCROLL_KEY));
+    if (!isNaN(scroll)) { window.scrollTo(0, scroll); }
+  }
+
+  function updateLive() {
+    var el = document.getElementById('live-ago');
+    if (!el || isNaN(generatedMs)) { return; }
+    // T12 验收追加：阅读视图下 tick 跳过 reload（见 tick 注释），LIVE 行联动提示
+    // 已暂停；回总览恢复「X 秒前更新」口径（本函数每秒执行，切换后 ≤1s 生效）。
+    if (currentDoc) { el.textContent = '阅读中已暂停刷新'; return; }
+    var seconds = Math.max(0, Math.round((Date.now() - generatedMs) / 1000));
+    el.textContent = seconds + ' 秒前更新';
+  }
+  function tick() {
+    if (document.hidden) { return; } // 跳过条件①：后台标签跳过本轮，省资源（P3）
+    saveState();
+    // T12 验收追加（用户验收变更）跳过条件②：阅读视图打开时跳过整页 reload——
+    // 5s reload 的白帧/重排/mermaid 重渲会打断文档阅读；状态照常保存。返回总览时
+    // 由 showOverview 陈旧判定立即补刷（R6 跳转路径除外，见 showOverview 注释）。
+    if (currentDoc) { return; }
+    // T12 验收追加（用户验收变更）跳过条件③：交互后 10s 内跳过——scroll/click/
+    // keydown/mousemove（节流）记录 lastInteraction，用户在看/操作总览时永不
+    // reload；页面静置满 10s 后下一轮 tick 恢复自动刷新（停止交互 ≤15s 恢复）。
+    if (Date.now() - lastInteraction < INTERACTION_PAUSE_MS) { return; }
+    location.reload();
+  }
+  function noteInteraction() {
+    // T12 验收追加：restoreState 的程序化 scrollTo 也会触发 scroll 事件——加载后
+    // 1s 内的事件不计交互，避免每轮 reload 的滚动恢复把自动刷新永久推迟；真实
+    // 用户持续交互会持续刷新 lastInteraction，不受此豁免影响。
+    if (Date.now() - loadedAt < 1000) { return; }
+    lastInteraction = Date.now();
+  }
+
+  window.addEventListener('DOMContentLoaded', function () {
+    if (DASH_FEATURE) {
+      document.title = DASH_FEATURE + ' 过程看板';
+      var brand = document.getElementById('brand-name');
+      if (brand) { brand.textContent = DASH_FEATURE; }
+    }
+    var generatedNode = document.getElementById('generated-at');
+    generatedMs = Date.parse(generatedNode ? generatedNode.textContent : '');
+    var interval = document.getElementById('live-interval');
+    if (interval) { interval.textContent = (REFRESH_INTERVAL_MS / 1000) + 's'; }
+    var note = document.getElementById('refreshNote');
+    if (note) { note.textContent = '每 ' + (REFRESH_INTERVAL_MS / 1000) + 's 自动刷新'; }
+    var depNode = document.getElementById('dep-graph');
+    depSource = depNode ? depNode.textContent : '';
+    applyTheme(themeMode()); // head 早绘脚本已置 data-theme：此处仅同步按钮态，同主题不触发重渲
+    var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    if (media) {
+      var followSystem = function () { if (themeMode() === 'auto') { applyTheme('auto'); } };
+      if (media.addEventListener) { media.addEventListener('change', followSystem); }
+      else if (media.addListener) { media.addListener(followSystem); }
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('.nav a[data-doc]'), function (link) {
+      link.addEventListener('click', function () {
+        var key = link.getAttribute('data-doc');
+        // review-arch-batch6 W-2 裁定：demo 基准 openDoc 内的 window.scrollTo(0,0)
+        // 仅接线在用户点击路径——openDoc 本体不加跳顶，因切主题重渲（rerenderMermaid）
+        // 与 reload 恢复（restoreState）同样经 openDoc，本体跳顶会破坏滚动位置保持
+        // （demo 自身即有该瑕疵，见 review-arch-batch6 W-2）。
+        if (key) { openDoc(key); window.scrollTo(0, 0); } else { showOverview(); }
+      });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.stage-seg[data-stage]'), function (seg) {
+      seg.addEventListener('click', function () { jump(seg.getAttribute('data-stage')); });
+    });
+    // T12 验收追加（用户验收变更）：全局交互感知——四类事件记录 lastInteraction
+    // （tick 跳过条件③）；scroll/mousemove 用 passive 不阻塞滚动，mousemove 500ms
+    // 节流；click/keydown 走 capture 捕获所有元素上的交互。
+    window.addEventListener('scroll', noteInteraction, { passive: true });
+    document.addEventListener('click', noteInteraction, true);
+    document.addEventListener('keydown', noteInteraction, true);
+    var lastMove = 0;
+    document.addEventListener('mousemove', function () {
+      if (Date.now() - lastMove < 500) { return; }
+      lastMove = Date.now();
+      noteInteraction();
+    }, { passive: true });
+    restoreState();
+    // 展开/折叠交互后立即写回 localStorage（capture 捕获所有 details 的 toggle）。
+    document.addEventListener('toggle', function () { saveState(); }, true);
+    if (!currentDoc) { renderOverviewMermaid(); }
+    updateLive();
+    setInterval(updateLive, 1000);
+    setInterval(tick, REFRESH_INTERVAL_MS);
+  });
+</script>
+</body>
+</html>

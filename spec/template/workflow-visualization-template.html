@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{FEATURE_NAME}} 流程复盘报告</title>
+<style>
+  :root{
+    --bg:#f5f6f8;--card:#fff;--ink:#1f2329;--sub:#646a73;--line:#e5e6eb;
+    --green:#1f9d55;--green-bg:#e6f7ec;--blue:#2f6fed;--blue-bg:#e8f0fe;
+    --orange:#d97706;--orange-bg:#fdf3e3;--gray:#8f959e;--gray-bg:#f0f1f3;
+    --red:#d83931;--red-bg:#fdeceb;--purple:#7c3aed;--purple-bg:#f1eafe
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);line-height:1.65;font-size:14px}
+  .wrap{max-width:1120px;margin:0 auto;padding:32px 24px 64px}
+  header.hero{background:linear-gradient(135deg,#1f2a44 0%,#2f6fed 100%);color:#fff;border-radius:14px;padding:28px 32px;margin-bottom:24px;box-shadow:0 10px 30px rgba(47,111,237,.14)}
+  header.hero h1{font-size:24px;margin-bottom:6px}
+  header.hero .subtitle{font-size:14px;opacity:.9;max-width:850px}
+  header.hero .meta{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;opacity:.94;margin-top:12px}
+  header.hero .meta b{font-weight:600}
+  header.hero a{color:#fff;text-decoration:underline;text-underline-offset:2px}
+  .tag{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+  .tag.done{background:var(--green-bg);color:var(--green)}
+  .tag.skipped{background:var(--gray-bg);color:var(--gray)}
+  .tag.rework{background:var(--orange-bg);color:var(--orange)}
+  .tag.info{background:var(--blue-bg);color:var(--blue)}
+  .tag.major{background:var(--red-bg);color:var(--red)}
+  .tag.decision{background:var(--purple-bg);color:var(--purple)}
+  header.hero .tag{background:rgba(255,255,255,.18);color:#fff}
+  section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px 28px;margin-bottom:24px}
+  section>h2{font-size:19px;margin-bottom:4px;display:flex;align-items:center;gap:10px}
+  section>h2 .no{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:8px;background:var(--blue);color:#fff;font-size:14px;flex:none}
+  section>p.desc{color:var(--sub);font-size:13px;margin-bottom:16px}
+  .brief{border-left:5px solid var(--green)}
+  .brief.attention{border-left-color:var(--orange)}
+  .brief.blocked{border-left-color:var(--red)}
+  .brief-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin:12px 0 16px}
+  .brief-summary{font-size:15px;max-width:820px}
+  .brief-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .brief-box{border:1px solid var(--line);background:#fafbfc;border-radius:10px;padding:14px 16px}
+  .brief-box h3{font-size:14px;margin-bottom:6px}
+  .brief-box ul{padding-left:18px;color:var(--sub)}
+  .brief-box li{padding:2px 0}
+  .tree-actions{margin:0 0 12px;text-align:right}
+  .tree-actions button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 12px;font-size:12px;color:var(--sub);cursor:pointer;margin-left:8px}
+  .tree-actions button:hover{border-color:var(--blue);color:var(--blue)}
+  .tree details{margin-left:18px}
+  .tree>details{margin-left:0}
+  .tree details details{border-left:2px solid var(--line);padding-left:14px;margin-left:9px}
+  .tree summary{cursor:pointer;list-style:none;padding:7px 10px;border-radius:8px;display:flex;align-items:baseline;gap:8px;user-select:none}
+  .tree summary::-webkit-details-marker{display:none}
+  .tree summary:hover{background:var(--gray-bg)}
+  .tree summary::before{content:"▸";color:var(--gray);flex:none;transition:transform .15s}
+  .tree details[open]>summary::before{transform:rotate(90deg)}
+  .tree .sid{font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;flex:none}
+  .tree .sname{font-weight:600;flex:none}
+  .tree .agent{font-size:12px;color:var(--purple)}
+  .tree .stage-group>summary{background:#f7f8fa;border:1px solid var(--line);border-radius:8px;font-weight:700}
+  .tree .stage-group .stage-name{font-size:14px}
+  .tree .stage-group .cnt{margin-left:auto;font-size:12px;color:var(--sub);font-weight:400}
+  .tree .stage-group>.empty{margin:4px 0 10px 18px}
+  .tree .leaf{padding:7px 10px 10px 28px;color:var(--sub);font-size:12.5px}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#f7f8fa;font-weight:600;white-space:nowrap}
+  td.id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;white-space:nowrap}
+  td.time{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:nowrap;color:var(--sub)}
+  td.note{min-width:220px;color:var(--sub)}
+  td a{color:var(--blue);font-weight:600;text-underline-offset:2px}
+  .tbl-wrap{overflow-x:auto;margin-top:14px}
+  .tbl-wrap h3{font-size:15px;margin:18px 0 6px}
+  .fgroup{border:1px solid var(--line);border-radius:10px;margin-bottom:12px;overflow:hidden}
+  .fgroup summary{cursor:pointer;list-style:none;padding:12px 16px;background:#f7f8fa;display:flex;align-items:center;gap:10px;font-weight:600;user-select:none}
+  .fgroup summary::-webkit-details-marker{display:none}
+  .fgroup summary::before{content:"▸";color:var(--gray);transition:transform .15s}
+  .fgroup[open] summary::before{transform:rotate(90deg)}
+  .fgroup .cnt{margin-left:auto;font-size:12px;color:var(--sub);font-weight:400}
+  .fgroup .body{padding:12px 18px}
+  .fgroup ul{list-style:none}
+  .fgroup li{padding:5px 0 5px 16px;position:relative;font-size:13px}
+  .fgroup li::before{content:"";position:absolute;left:2px;top:13px;width:6px;height:6px;border-radius:50%;background:var(--blue)}
+  .fgroup li .p{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--purple);word-break:break-all}
+  .fgroup li .d{color:var(--sub)}
+  .empty{padding:14px;color:var(--gray);background:#fafbfc;border:1px dashed var(--line);border-radius:8px}
+  .tl{position:relative;padding-left:26px}
+  .tl::before{content:"";position:absolute;left:8px;top:6px;bottom:6px;width:2px;background:var(--line)}
+  .tl-item{position:relative;padding:0 0 18px 12px}
+  .tl-item::before{content:"";position:absolute;left:-24px;top:6px;width:12px;height:12px;border-radius:50%;background:#fff;border:3px solid var(--blue)}
+  .tl-item.milestone::before{border-color:var(--green)}
+  .tl-item.change::before{border-color:var(--orange)}
+  .tl-item.review::before{border-color:var(--purple)}
+  .tl-item .t{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--sub)}
+  .tl-item .h{font-weight:600;margin:1px 0}
+  .tl-item .b{color:var(--sub);font-size:13px}
+  .tl-item .g{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--orange);margin-bottom:4px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}
+  .card{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:#fafbfc}
+  .card.wide{grid-column:span 2}
+  .card .v{font-size:26px;font-weight:700;color:var(--blue);line-height:1.2}
+  .card .v small{font-size:13px;font-weight:400;color:var(--sub)}
+  .card .k{font-size:12.5px;color:var(--sub);margin-top:2px}
+  .card .s{font-size:12px;color:var(--sub);margin-top:6px;line-height:1.45}
+  footer{color:var(--gray);font-size:12px;text-align:center;margin-top:8px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;background:var(--gray-bg);padding:1px 5px;border-radius:4px}
+  @media(max-width:720px){.wrap{padding:16px 10px 40px}header.hero,section{padding:20px 16px}.brief-grid{grid-template-columns:1fr}.brief-head{display:block}.brief-head .tag{margin-top:8px}}
+</style>
+</head>
+<body data-report-layout="retrospective-light">
+<div class="wrap">
+<header class="hero">
+  <h1>{{FEATURE_TITLE}} 流程复盘报告</h1>
+  <div class="subtitle">{{FEATURE_SUBTITLE}}</div>
+  <div class="meta">
+    <span><b>状态</b>：<span class="tag">{{FEATURE_STATE}}</span></span>
+    <span><b>规模</b>：{{FEATURE_SCALE}}</span>
+    <span><b>模式</b>：{{FEATURE_MODE}}</span>
+    <span><b>ONES 需求</b>：{{ONES_REQUIREMENT}}</span>
+    <span><b>分支</b>：{{FEATURE_BRANCH}}</span>
+    <span><b>周期</b>：{{FEATURE_CYCLE}}</span>
+  </div>
+</header>
+
+<section class="metrics">
+  <h2><span class="no">1</span>度量摘要</h2>
+  <p class="desc">用户介入、澄清规模与总执行时间放在最前，便于一眼看到过程成本；其余卡片仍是规模信号，不替代测试、评审或上线证据。</p>
+  <div class="cards"><!-- AGENT_INJECT: metric cards --></div>
+</section>
+
+<section class="brief {{BRIEF_LEVEL}}">
+  <h2><span class="no">2</span>过程分析 Brief</h2>
+  <p class="desc">根据 STATUS.md、task.md、澄清记录、CHANGELOG 与 ONES 本地同步证据生成；不补写缺失事实。</p>
+  <div class="brief-head">
+    <div class="brief-summary">{{BRIEF_SUMMARY}}</div>
+    <span class="tag {{BRIEF_TAG_CLASS}}">{{BRIEF_HEALTH}}</span>
+  </div>
+  <div class="brief-grid">
+    <div class="brief-box">
+      <h3>发现的问题</h3>
+      <ul><!-- AGENT_INJECT: process brief issues --></ul>
+    </div>
+    <div class="brief-box">
+      <h3>改进建议</h3>
+      <ul><!-- AGENT_INJECT: process brief recommendations --></ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="no">3</span>Pipeline 状态树</h2>
+  <p class="desc">流水线每一步的最终状态、执行角色与备注，按「需求 → 开发 → 测试 → 审查」四阶段分组（数据源：STATUS.md；节点→阶段映射以 PIPELINE_STEP_STAGES 为单一事实源，映射未覆盖的步骤归入末尾「未归组」组）。</p>
+  <div class="tree-actions"><button onclick="setAll(true)">全部展开</button><button onclick="setAll(false)">全部折叠</button></div>
+  <div class="tree" id="pipelineTree"><!-- AGENT_INJECT: pipeline tree --></div>
+</section>
+
+<section>
+  <h2><span class="no">4</span>任务执行记录</h2>
+  <p class="desc">设计任务和开发任务的状态、门禁、时间及 ONES 工作项。存在 spaceId 和工作项 ID 时可直接跳转。</p>
+  <div class="tbl-wrap">
+    <h3>设计任务</h3>
+    <table>
+      <thead><tr><th>任务ID</th><th>描述</th><th>状态</th><th>实际开始</th><th>实际完成</th><th>ONES 任务</th><th>备注</th></tr></thead>
+      <tbody><!-- AGENT_INJECT: design task rows --></tbody>
+    </table>
+    <h3>开发 / 验证任务</h3>
+    <table>
+      <thead><tr><th>任务ID</th><th>描述</th><th>状态</th><th>门禁 / 产出</th><th>实际开始</th><th>实际完成</th><th>ONES 任务</th></tr></thead>
+      <tbody><!-- AGENT_INJECT: development task rows --></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2><span class="no">5</span>文件清单</h2>
+  <p class="desc">从 Feature 产物、任务预计写入范围与产出备注中提取，并按首级目录或模块归类。</p>
+  <!-- AGENT_INJECT: file groups -->
+</section>
+
+<section>
+  <h2><span class="no">6</span>执行时间线</h2>
+  <p class="desc">按本地文档中的时间排序；相邻事件之间标出间隔，不补写缺失时刻。</p>
+  <div class="tl"><!-- AGENT_INJECT: timeline items --></div>
+</section>
+
+<footer>Generated by <strong>devkit-flow flow report</strong> · {{GENERATED_AT}} · 数据源为本地 Feature 产物</footer>
+</div>
+<script>
+  function setAll(open){document.querySelectorAll('#pipelineTree details,.fgroup').forEach(function(node){node.open=open})}
+</script>
+</body>
+</html>

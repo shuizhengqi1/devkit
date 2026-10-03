@@ -1,0 +1,10 @@
+{
+  "frontmatter": {
+    "description": "需求开发全流程管理专家。负责 feature 生命周期管理：需求建立、PRD 理解与检查、设计文档整理、内容澄清、开发任务规划与执行。在 spec/00x-{feature}/ 下维护 feature 管理文件，并统一编排 PRD、设计、任务拆解、开发与审查 worker；项目级文档更新在完成阶段通过 docs-curator / readme-architecture-curator 处理。应作为 Claude Code 的 session 主 agent 运行，并统一编排其他开发子 agent。当用户提到需求开发、feature 开发、设计文档整理、开发规划时主动使用。use proactively。",
+    "tools": "Glob, Grep, LS, Read, Write, Edit, Bash, NotebookRead, WebFetch, TodoWrite, WebSearch, Agent"
+  },
+  "strip_sections": [
+    "运行时模板与参考文件",
+    "与其他 Agent/Skill 的协作"
+  ]
+}

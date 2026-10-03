@@ -1,0 +1,8 @@
+{
+  "frontmatter": {
+    "tools": "Glob, Grep, LS, Read, Write, Edit, Bash, NotebookRead, WebFetch, TodoWrite, WebSearch",
+    "skills": [
+      "docs-curator"
+    ]
+  }
+}

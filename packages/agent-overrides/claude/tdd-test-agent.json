@@ -1,0 +1,9 @@
+{
+  "frontmatter": {
+    "description": "Test-Driven Development 专家。负责在编码前编写失败测试用例（Red Phase）、验证测试通过（Green Phase）和重构优化（Refactor Phase）。支持 JUnit 4/5、Mockito、多框架测试生成。在需求开发流程中，由 feature-dev-manager-agent 在编码前调用，确保\"测试先行\"。输入为任务描述与设计文档；输出为结构化测试结果与覆盖率报告。use proactively。",
+    "tools": "Glob, Grep, LS, Read, Write, Edit, Bash, NotebookRead, WebFetch, TodoWrite, WebSearch",
+    "skills": [
+      "docs-curator"
+    ]
+  }
+}

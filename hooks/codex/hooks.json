@@ -1,0 +1,27 @@
+{
+  "description": "Check the Devkit DevKit runtime without modifying the workspace.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "devkit-flow runtime check --runtime codex --target \"${PWD}\" --hook-json",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "devkit-flow runtime session-end --runtime codex --target \"${PWD}\" --hook-json --hook-event Stop",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
