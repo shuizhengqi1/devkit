@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from devkit_flow.config import _config_object_layer, _require_boolean_enabled, load_devkit_config, save_devkit_config
-from devkit_flow.constants import CLEAR_ONLY_GLOBAL, HTML_UI_INVALID_LAYER, INHERIT_ONLY_PROJECT, SPEC_ARTIFACTS_INVALID_LAYER, SPEC_ARTIFACTS_SCOPE_GLOB, SPECRULES_CACHE_RELATIVE_PATH, SPECRULES_CUSTOM_CACHE_RELATIVE_PATH, SPECRULES_FOLLOW_GLOBAL_SCOPE, SPECRULES_ILLEGAL_REASON, SPECRULES_INVALID_LAYER, SPECRULES_INVALID_URL_MESSAGE, SPECRULES_REPO_URL, SPECRULES_REPO_URL_SCOPE, _SPECRULES_GITMODULES_PATH, _SPECRULES_SCP_URL
+from devkit_flow.config import _config_object_layer, _require_boolean_enabled, _specrules_configured_repo_url, load_config_file, load_devkit_config, merge_specrules_switch, save_devkit_config, validate_specrules_git_url
+from devkit_flow.constants import CLEAR_ONLY_GLOBAL, CONFIG_PATH, HTML_UI_INVALID_LAYER, INHERIT_ONLY_PROJECT, PROGRESS_BAR_INVALID_LAYER, SPECRULES_FOLLOW_GLOBAL_SCOPE, SPECRULES_ILLEGAL_REASON, SPECRULES_INVALID_LAYER, SPECRULES_INVALID_URL_MESSAGE, SPECRULES_REPO_URL, SPECRULES_REPO_URL_SCOPE, SPEC_ARTIFACTS_INVALID_LAYER, SPEC_ARTIFACTS_SCOPE_GLOB, _SPECRULES_GITMODULES_PATH
 from devkit_flow.errors import DevkitFlowError
-from devkit_flow.models import DashboardSwitch, DocsCuratorSwitch, GitUrl, HtmlUiSwitch, SpecArtifactsSwitch, SpecrulesResolution, SpecrulesSwitch
+from devkit_flow.models import DashboardSwitch, DocsCuratorSwitch, HtmlUiSwitch, ProgressBarSwitch, SpecArtifactsSwitch, SpecrulesResolution
 from devkit_flow.textio import compact_error, emit
+from devkit_flow.project_detect import ProfileCache
+from devkit_flow.rule_sources import RULE_PACKAGE_KINDS, BindingReceipt, RuleSourceCatalog, RuleSourceSelector, compute_rule_context
 
 
 def format_specrules_status_text(summary: dict[str, Any]) -> str:
@@ -60,37 +61,6 @@ def merge_docs_curator(global_config: dict[str, Any], project_config: dict[str, 
 def docs_curator_summary(workspace: Path) -> dict[str, Any]:
     resolution = load_devkit_config(workspace)
     return asdict(merge_docs_curator(resolution.global_config, resolution.project_config))
-
-
-def merge_specrules_switch(global_config: dict[str, Any], project_config: dict[str, Any]) -> SpecrulesSwitch:
-    global_layer = _config_object_layer(global_config, "specrules", "Invalid specrules")
-    project_layer = _config_object_layer(project_config, "specrules", "Invalid specrules")
-    if global_layer is not None:
-        _require_boolean_enabled(global_layer, default=True)
-    if project_layer is not None:
-        _require_boolean_enabled(project_layer, default=True)
-    if project_layer is not None and "enabled" in project_layer:
-        return SpecrulesSwitch(
-            enabled=bool(project_layer["enabled"]),
-            source="project",
-            default_enabled=True,
-        )
-    if global_layer is not None and "enabled" in global_layer:
-        return SpecrulesSwitch(
-            enabled=bool(global_layer["enabled"]),
-            source="global",
-            default_enabled=True,
-        )
-    return SpecrulesSwitch(enabled=False, source="default", default_enabled=False)
-
-
-def _specrules_configured_repo_url(layer: dict[str, Any] | None) -> str | None:
-    if layer is None or "repoUrl" not in layer:
-        return None
-    value = layer["repoUrl"]
-    if not isinstance(value, str):
-        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
-    return validate_specrules_git_url(value).normalized
 
 
 def _specrules_workspace_tree(workspace: Path) -> str:
@@ -169,33 +139,6 @@ def resolve_specrules(workspace: Path) -> SpecrulesResolution:
 
 def specrules_summary(workspace: Path) -> dict[str, Any]:
     return asdict(resolve_specrules(workspace))
-
-
-def validate_specrules_git_url(raw: str) -> GitUrl:
-    if not isinstance(raw, str):
-        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
-    normalized = raw.strip()
-    if not normalized:
-        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
-    scp = _SPECRULES_SCP_URL.fullmatch(normalized)
-    if scp is not None:
-        host, path = scp.group(1), scp.group(2)
-        if host and path.strip("/"):
-            return GitUrl(raw=raw, normalized=normalized, scheme="ssh")
-        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
-    parsed = urlparse(normalized)
-    scheme = (parsed.scheme or "").lower()
-    if scheme in {"ssh", "https"} and parsed.hostname and parsed.path.strip("/"):
-        return GitUrl(raw=raw, normalized=normalized, scheme=scheme)
-    raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
-
-
-def specrules_cache_dir_for_url(url: str) -> Path:
-    normalized = validate_specrules_git_url(url).normalized
-    if normalized == SPECRULES_REPO_URL:
-        return Path.home() / SPECRULES_CACHE_RELATIVE_PATH
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-    return Path.home() / SPECRULES_CUSTOM_CACHE_RELATIVE_PATH / digest
 
 
 def _persist_specrules_repo_url(raw: str) -> str:
@@ -288,16 +231,219 @@ def command_specrules_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _binding_receipt_summary(receipt: BindingReceipt | None) -> dict[str, Any] | None:
+    if receipt is None:
+        return None
+    if not receipt.readable:
+        return {"readable": False, "problem": receipt.problem, "adoptedBy": None, "boundAt": None, "modules": []}
+    return {
+        "readable": True,
+        "problem": None,
+        "adoptedBy": receipt.adoptedBy,
+        "boundAt": receipt.boundAt,
+        "modules": [
+            {
+                "module": item.module,
+                "kind": item.kind,
+                "repoUrl": item.repoUrl,
+                "commit": item.commit,
+                "packageVersion": item.packageVersion,
+                "distribution": item.distribution,
+            }
+            for item in receipt.modules
+        ],
+    }
+
+
+def specrules_routing_preview(workspace: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``specrules status`` 的加性键（设计 §4.7.1.11）：``rule_routing`` 为六步判定预览（画像取自缓存，不识别、
+    不拉取、不写文件），``binding`` 为绑定回执摘要（无回执为 null）。任何异常只体现在 ``rule_routing.error``。"""
+    receipt: BindingReceipt | None = None
+    try:
+        receipt = BindingReceipt.load(workspace)
+        global_config, _ = load_config_file(Path.home() / ".config" / "devkit" / "config.json")
+        project_config, _ = load_config_file(workspace / CONFIG_PATH)
+        catalog = RuleSourceCatalog.fromConfig(global_config, project_config)
+        profile = ProfileCache().read(workspace)
+        decision = RuleSourceSelector().routingMode(
+            workspace, catalog, profile, receipt, catalog.sourceDirs(), allowImplicitAdoption=False
+        )
+        routing: dict[str, Any] = {
+            "mode": decision.mode,
+            "routing_source": decision.source,
+            "adoptedBy": decision.adoptedBy,
+            "advice": list(decision.advice),
+        }
+    except Exception as error:  # noqa: BLE001 - 加性诊断键不得让既有命令失败
+        routing = {"mode": None, "routing_source": None, "adoptedBy": None, "advice": [], "error": compact_error(error)}
+    return routing, _binding_receipt_summary(receipt)
+
+
 def command_specrules_status(args: argparse.Namespace) -> int:
-    summary = specrules_summary(Path.cwd())
+    workspace = Path.cwd()
+    summary = specrules_summary(workspace)
+    routing, binding = specrules_routing_preview(workspace)
     emit(
         {
             "status": "ok",
             "message": format_specrules_status_text(summary),
             "specrules": summary,
+            # 016 T-05：只加键（既有键与 message 不变）
+            "rule_routing": routing,
+            "binding": binding,
         },
         args.format,
     )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 016 T-05：specrules catalog status | configure（接口 §2.4）
+# ---------------------------------------------------------------------------
+
+
+def _raw_catalog_entries(config: dict[str, Any]) -> dict[str, Any]:
+    """D-32 ④：禁用态原样列出用户写入的 catalog 条目（不校验、不报错，标 validated=false）。"""
+    rules = config.get("ruleSources") if isinstance(config, dict) else None
+    catalog = rules.get("catalog") if isinstance(rules, dict) else None
+    if not isinstance(catalog, dict):
+        return {}
+    listed: dict[str, Any] = {}
+    for kind, entry in catalog.items():
+        repo_url = entry.get("repoUrl") if isinstance(entry, dict) else entry
+        listed[str(kind)] = {"repoUrl": repo_url, "validated": False}
+    return listed
+
+
+def specrules_catalog_summary(workspace: Path) -> dict[str, Any]:
+    """``specrules catalog status`` 主体：catalog 两层与合并结果、路由预览、绑定预览（只读已有缓存，不挂载、不拉取）。"""
+    global_config, _ = load_config_file(Path.home() / ".config" / "devkit" / "config.json")
+    project_config, _ = load_config_file(workspace / CONFIG_PATH)
+    catalog = RuleSourceCatalog.fromConfig(global_config, project_config)
+    if not catalog.specrulesEnabled:
+        return {
+            "catalog": {
+                "global": _raw_catalog_entries(global_config),
+                "project": _raw_catalog_entries(project_config),
+                "merged": {},
+            },
+            "routing_mode": "disabled",
+            "routing_source": "disabled",
+            "adopted_by": None,
+            "modules": [],
+            "advice": ["specrules.enabled=false：ruleSources 不生效，catalog 条目未校验"]
+            + (["specrules 配置非法：enabled=false 与项目 repoUrl 并存"] if catalog.specrulesInvalid else []),
+        }
+    merged: dict[str, Any] = {}
+    for kind in RULE_PACKAGE_KINDS:
+        if kind in catalog.projectCatalog:
+            merged[kind] = {"repoUrl": catalog.projectCatalog[kind], "source": "project"}
+        elif kind in catalog.globalCatalog:
+            merged[kind] = {"repoUrl": catalog.globalCatalog[kind], "source": "global"}
+        elif catalog.urlFor(kind) is not None:
+            merged[kind] = {"repoUrl": catalog.urlFor(kind), "source": "default"}
+    context, decision = compute_rule_context(workspace)
+    modules = []
+    for item in context.modules:
+        binding = item.binding
+        modules.append(
+            {
+                "module": binding.module,
+                "kind": binding.kind,
+                "bindingStatus": binding.bindingStatus,
+                "repoUrl": binding.repoUrl,
+                "packageVersion": binding.packageVersion,
+                "entry": binding.entry,
+                "advice": list(binding.advice),
+            }
+        )
+    return {
+        "catalog": {
+            "global": {kind: {"repoUrl": url, "validated": True} for kind, url in catalog.globalCatalog.items()},
+            "project": {kind: {"repoUrl": url, "validated": True} for kind, url in catalog.projectCatalog.items()},
+            "merged": merged,
+        },
+        "routing_mode": decision.mode,
+        "routing_source": decision.source,
+        "adopted_by": decision.adoptedBy,
+        "modules": modules,
+        "advice": list(decision.advice),
+    }
+
+
+def _format_catalog_status_text(summary: dict[str, Any]) -> str:
+    adopted = f", {summary['adopted_by']}" if summary.get("adopted_by") else ""
+    lines = [f"rule routing: {summary['routing_mode']} ({summary['routing_source']}{adopted})"]
+    for kind, entry in summary["catalog"]["merged"].items():
+        lines.append(f"  catalog {kind}: {entry['repoUrl']} (source={entry['source']})")
+    for scope in ("global", "project"):
+        for kind, entry in summary["catalog"][scope].items():
+            if not entry.get("validated", True):
+                lines.append(f"  catalog {kind} ({scope}, not validated): {entry['repoUrl']}")
+    for module in summary["modules"]:
+        lines.append(f"  - {module['module']} [{module['kind'] or '-'}] {module['bindingStatus']}")
+    lines.extend(f"  advice: {item}" for item in summary["advice"])
+    return "\n".join(lines)
+
+
+def command_specrules_catalog_status(args: argparse.Namespace) -> int:
+    summary = specrules_catalog_summary(Path.cwd())
+    emit({"status": "ok", "message": _format_catalog_status_text(summary), **summary}, args.format)
+    return 0
+
+
+def command_specrules_catalog_configure(args: argparse.Namespace) -> int:
+    """只写配置、不挂载（挂载在下一次 setup）；校验失败 exit 1 且配置不写入（接口 §2.4）。"""
+    kind = getattr(args, "kind", None)
+    repo_url = getattr(args, "repo_url", None)
+    remove = bool(getattr(args, "remove", False))
+    routing = getattr(args, "routing", None)
+    module = getattr(args, "module", None)
+    scope = getattr(args, "scope", "project") or "project"
+    if (routing is not None or module is not None) and scope == "global":
+        raise DevkitFlowError(
+            "--routing / --module are project-only; use --scope project",
+            error_code="SPECRULES_CATALOG_PROJECT_ONLY",
+        )
+    if remove and repo_url is not None:
+        raise DevkitFlowError("--remove cannot be combined with --repo-url", error_code="SPECRULES_CATALOG_MUTEX")
+    if (repo_url is not None or remove or module is not None) and kind is None:
+        raise DevkitFlowError(
+            "--repo-url / --remove / --module require --kind", error_code="SPECRULES_CATALOG_KIND_REQUIRED"
+        )
+    if repo_url is not None:
+        # 校验规则同 specrules configure --repo-url（ssh / https / scp）；catalog 命令按接口 §2.4 统一带错误码
+        try:
+            _persist_specrules_repo_url(repo_url)
+        except DevkitFlowError as error:
+            if error.error_code:
+                raise
+            raise DevkitFlowError(str(error), error_code="SPECRULES_INVALID_REPO_URL") from error
+    workspace = Path.cwd()
+    loaded = load_devkit_config(workspace)
+    target = loaded.global_config if scope == "global" else loaded.project_config
+    if kind is not None and module is None and repo_url is None and not remove:
+        raise DevkitFlowError(
+            "--kind needs --repo-url or --remove (or --module for a module binding)",
+            error_code="SPECRULES_CATALOG_KIND_REQUIRED",
+        )
+    patched = RuleSourceCatalog.configurePatch(
+        target, kind, repo_url, remove, routing=routing, module=module
+    )
+    save_devkit_config(workspace, patched, scope)
+    changes = []
+    if routing is not None:
+        changes.append(f"routing={routing}")
+    if module is not None:
+        changes.append(f"module {module} {'removed' if remove else f'→ {kind}' + (f' {repo_url}' if repo_url else '')}")
+    elif kind is not None:
+        changes.append(f"catalog {kind} {'removed' if remove else f'→ {repo_url}'}")
+    message = f"rule source catalog configured ({scope}): {', '.join(changes)}; run devkit-flow setup to apply"
+    try:
+        summary = specrules_catalog_summary(workspace)
+    except DevkitFlowError as error:
+        summary = {"error": compact_error(error)}
+    emit({"status": "configured", "message": message, "scope": scope, **summary}, args.format)
     return 0
 
 
@@ -580,6 +726,82 @@ def command_html_ui_status(args: argparse.Namespace) -> int:
             "status": "ok",
             "message": format_html_ui_status_text(summary),
             "html_ui": summary,
+        },
+        args.format,
+    )
+    return 0
+
+
+def format_progress_bar_status_text(summary: dict[str, Any]) -> str:
+    state = "on" if summary.get("enabled") else "off"
+    text = f"progress-bar: {state} (source={summary.get('source')})"
+    if not summary.get("enabled"):
+        text += "; 已关闭：Claude Code 输入框上方不再显示 DevKit 进度行，/devkit 面板与 token 记账不受影响"
+    return text
+
+
+def merge_progress_bar(global_config: dict[str, Any], project_config: dict[str, Any]) -> ProgressBarSwitch:
+    global_layer = _config_object_layer(global_config, "progressBar", PROGRESS_BAR_INVALID_LAYER)
+    project_layer = _config_object_layer(project_config, "progressBar", PROGRESS_BAR_INVALID_LAYER)
+    if global_layer is not None:
+        _require_boolean_enabled(global_layer, default=True)
+    if project_layer is not None:
+        return ProgressBarSwitch(
+            enabled=_require_boolean_enabled(project_layer, default=True),
+            source="project",
+            default_enabled=True,
+        )
+    if global_layer is not None:
+        return ProgressBarSwitch(
+            enabled=_require_boolean_enabled(global_layer, default=True),
+            source="global",
+            default_enabled=True,
+        )
+    return ProgressBarSwitch(enabled=True, source="default", default_enabled=True)
+
+
+def progress_bar_summary(workspace: Path) -> dict[str, Any]:
+    resolution = load_devkit_config(workspace)
+    return asdict(merge_progress_bar(resolution.global_config, resolution.project_config))
+
+
+def remove_progress_bar(config: dict[str, Any]) -> None:
+    config.pop("progressBar", None)
+
+
+def command_progress_bar_configure(args: argparse.Namespace) -> int:
+    workspace = Path.cwd()
+    resolution = load_devkit_config(workspace)
+    target_config = copy.deepcopy(
+        resolution.global_config if args.scope == "global" else resolution.project_config
+    )
+    if args.inherit:
+        if args.scope != "project":
+            raise DevkitFlowError(INHERIT_ONLY_PROJECT)
+        remove_progress_bar(target_config)
+        message = "Project progress bar override removed; global inheritance restored."
+    elif args.clear:
+        if args.scope != "global":
+            raise DevkitFlowError(CLEAR_ONLY_GLOBAL)
+        remove_progress_bar(target_config)
+        message = "Global progress bar configuration cleared."
+    else:
+        enabled = bool(args.enable)
+        target_config["progressBar"] = {"enabled": enabled}
+        message = f"Progress bar {'enabled' if enabled else 'disabled'} for {args.scope} scope."
+    save_devkit_config(workspace, target_config, args.scope)
+    summary = progress_bar_summary(workspace)
+    emit({"status": "configured", "message": message, "progress_bar": summary}, args.format)
+    return 0
+
+
+def command_progress_bar_status(args: argparse.Namespace) -> int:
+    summary = progress_bar_summary(Path.cwd())
+    emit(
+        {
+            "status": "ok",
+            "message": format_progress_bar_status_text(summary),
+            "progress_bar": summary,
         },
         args.format,
     )

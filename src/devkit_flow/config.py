@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import shutil
 from pathlib import Path
 from typing import Any
-from devkit_flow.constants import ANSI_ESCAPE, CONFIG_PATH, KBA_INSTALL_COMMAND, KBA_SKILL_PACKAGE_NAME
+from urllib.parse import urlparse
+from devkit_flow.constants import ANSI_ESCAPE, CONFIG_PATH, KBA_INSTALL_COMMAND, KBA_SKILL_PACKAGE_NAME, SPECRULES_CACHE_RELATIVE_PATH, SPECRULES_CUSTOM_CACHE_RELATIVE_PATH, SPECRULES_INVALID_URL_MESSAGE, SPECRULES_REPO_URL, _SPECRULES_SCP_URL
 from devkit_flow.errors import DevkitFlowError
-from devkit_flow.models import ConfigResolution, ReviewGateTiming
+from devkit_flow.models import ConfigResolution, GitUrl, ReviewGateTiming, SpecrulesSwitch
 from devkit_flow.textio import atomic_write_text, emit, run_external
 
 
@@ -307,6 +309,13 @@ def save_devkit_config(workspace: Path, config: dict[str, Any], scope: str = "pr
     atomic_write_text(target, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
 
 
+# 跨模块共享的配置层 helper（016 T-02 arch P2-1 / P2-2，T-04 注明）：
+# `_config_object_layer`、`_require_boolean_enabled`、`_specrules_configured_repo_url` 虽带前导下划线，
+# 但被 switches / review / rule_sources 顶层 import，属于本模块对内公开的共享函数，保留原名
+# （bundle 为扁平命名空间，且既有测试按名打桩 `config._config_object_layer`）。
+# 下方 specrules URL 校验、缓存目录推导与开关合并为满足 MODULE_ORDER 拓扑从 switches 下沉到此处：
+# rule_sources（早于 switches / setup，且禁止 import 二者，见 build_devkit_flow_bundle.FORBIDDEN_TOP_LEVEL_IMPORTS）
+# 依赖它们，禁止移回 switches。
 def _config_object_layer(config: dict[str, Any], key: str, invalid_message: str) -> dict[str, Any] | None:
     if not isinstance(config, dict):
         raise DevkitFlowError(invalid_message)
@@ -325,6 +334,64 @@ def _require_boolean_enabled(layer: dict[str, Any], *, default: bool) -> bool:
     if not isinstance(value, bool):
         raise DevkitFlowError("expected a boolean")
     return value
+
+
+def validate_specrules_git_url(raw: str) -> GitUrl:
+    if not isinstance(raw, str):
+        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
+    normalized = raw.strip()
+    if not normalized:
+        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
+    scp = _SPECRULES_SCP_URL.fullmatch(normalized)
+    if scp is not None:
+        host, path = scp.group(1), scp.group(2)
+        if host and path.strip("/"):
+            return GitUrl(raw=raw, normalized=normalized, scheme="ssh")
+        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
+    parsed = urlparse(normalized)
+    scheme = (parsed.scheme or "").lower()
+    if scheme in {"ssh", "https"} and parsed.hostname and parsed.path.strip("/"):
+        return GitUrl(raw=raw, normalized=normalized, scheme=scheme)
+    raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
+
+
+def specrules_cache_dir_for_url(url: str) -> Path:
+    normalized = validate_specrules_git_url(url).normalized
+    if normalized == SPECRULES_REPO_URL:
+        return Path.home() / SPECRULES_CACHE_RELATIVE_PATH
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return Path.home() / SPECRULES_CUSTOM_CACHE_RELATIVE_PATH / digest
+
+
+def merge_specrules_switch(global_config: dict[str, Any], project_config: dict[str, Any]) -> SpecrulesSwitch:
+    global_layer = _config_object_layer(global_config, "specrules", "Invalid specrules")
+    project_layer = _config_object_layer(project_config, "specrules", "Invalid specrules")
+    if global_layer is not None:
+        _require_boolean_enabled(global_layer, default=True)
+    if project_layer is not None:
+        _require_boolean_enabled(project_layer, default=True)
+    if project_layer is not None and "enabled" in project_layer:
+        return SpecrulesSwitch(
+            enabled=bool(project_layer["enabled"]),
+            source="project",
+            default_enabled=True,
+        )
+    if global_layer is not None and "enabled" in global_layer:
+        return SpecrulesSwitch(
+            enabled=bool(global_layer["enabled"]),
+            source="global",
+            default_enabled=True,
+        )
+    return SpecrulesSwitch(enabled=False, source="default", default_enabled=False)
+
+
+def _specrules_configured_repo_url(layer: dict[str, Any] | None) -> str | None:
+    if layer is None or "repoUrl" not in layer:
+        return None
+    value = layer["repoUrl"]
+    if not isinstance(value, str):
+        raise DevkitFlowError(SPECRULES_INVALID_URL_MESSAGE)
+    return validate_specrules_git_url(value).normalized
 
 
 REVIEW_GATE_TIMING_INVALID_LAYER = (

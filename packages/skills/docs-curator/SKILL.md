@@ -86,6 +86,13 @@ docs/
 | MQ Consumer | `@MQConsumer` / `implements MessageListener` | topic: `order-paid` |
 | MQ Producer | `@Autowired MQProducer` / `mqClient.send(` | topic: `refund-created` |
 | 定时任务 | `@Scheduled` 注解的方法所在类 | `PaymentSettleJob` |
+| 前端组件 | `src/components/**`、`src/pages/**`、`src/views/**` 下导出的 React / Vue 组件（`.tsx` / `.vue`） | 页面级组件按路由归模块，通用组件归 `shared` |
+| 前端 hooks / composables | `src/hooks/**`（`useXxx.ts`）、`src/composables/**`（`useXxx.ts`） | 以所服务的页面 / 业务域归类 |
+| 前端状态模块 | `src/store/**`、`src/stores/**`（Zustand / Pinia / Redux slice）、`createContext` 导出 | store 名 / slice 名即候选模块 |
+| 包 `exports` | `package.json` 的 `exports` / `main` / `types` 字段指向的公共入口（`publishForm=npm-package`） | 每个 export 子路径视为对外契约单元 |
+| 前端路由表 | `createBrowserRouter` / `<Route>` / `createRouter({ routes })` 定义的路由表 | 路由前缀即业务模块边界 |
+
+> 上表按模块画像（`devkit-flow project detect --format json` 的 `modules[]`）决定扫哪组：Java 行按 `languages` 含 `java`（`classification` 为 `java-service` / `java-library`）扫描；前端行按 `classification=frontend-app`，或 `classification=library` 且 `languages` 含 `typescript` / `javascript`（既含 `componentLibrary=true` 的组件库，也含 `publishForm=npm-package` 的纯 TS 库）扫描；React / Vue 等框架看 `frameworks`（取值如 `react` / `vue` / `angular` / `svelte` / `solid`），不作为扫描前提。`languages` / `frameworks` 均为数组，字段名与枚举值以 `devkit-flow project detect --format json` 的实际输出为准。项目级 `classification=mixed` 时按 `modules[]` 逐模块判断，两组都扫，按模块目录分别归类。
 
 **HTTP vs Thrift 判断优先级**（同一个类可能同时满足多条规则，按优先级取最高匹配）：
 
@@ -328,9 +335,10 @@ archive 模式允许在 staged 目标文件中删除重复或过时内容；该�
 **模块查找规则**（优先级从高到低）：
 
 1. **按入口类名匹配**：从 `changed_files` 中找到 Gateway/Thrift 实现类名，在 modules.yml 的 `entrypoints[].class` 中查找
-2. **按 MQ topic 匹配**：从 `change_summary` 或 `changed_files` 中识别 topic，在 modules.yml 的 `entrypoints[].topic` 中查找
-3. **按 feature 名称前缀匹配**：将 `feature` 前缀与 modules.yml 中的 `id` 做前缀匹配（如 `payment-refund` → `payment`）
-4. **兜底**：使用 `general`，在文档中注明来源 feature，并提示用户更新 modules.yml
+2. **按前端入口路径匹配**：对 `type` 为 `component` / `hook` / `store` / `export` / `route` 的入口，`entrypoints[].class` 存的是相对路径（文件或目录）；将 `changed_files` 与其做**精确匹配或路径前缀匹配**（登记目录 `src/pages/order/` 命中 `src/pages/order/OrderList.tsx`；登记文件 `src/store/order.ts` 只精确命中自身）。`export` 类入口登记的是 `package.json` exports 子路径，匹配时用其指向的目标文件（`exports["./x"]` 的 `import` / `default` / `types` 值）与 `changed_files` 比对。多模块命中时每个模块各写一份
+3. **按 MQ topic 匹配**：从 `change_summary` 或 `changed_files` 中识别 topic，在 modules.yml 的 `entrypoints[].topic` 中查找
+4. **按 feature 名称前缀匹配**：将 `feature` 前缀与 modules.yml 中的 `id` 做前缀匹配（如 `payment-refund` → `payment`）
+5. **兜底**：使用 `general`，在文档中注明来源 feature，并提示用户更新 modules.yml。已登记前端入口路径却仍落入 `general` 视为匹配规则缺陷，不得发生
 
 #### Step 2：确认 docs/ 目录结构存在
 
@@ -352,6 +360,9 @@ archive 模式允许在 staged 目标文件中删除重复或过时内容；该�
 | 新增/修改数据表、实体、ER 关系 | `data-model.md` |
 | 新增/修改模块职责、对外依赖、接口边界 | `overview.md` |
 | 新增/修改 Gateway、Thrift、Request/Response/DTO/Enum 等对外接口契约 | `interface.md` |
+| 新增/修改前端组件、页面、hooks / composables（`src/components/**`、`src/pages/**`、`src/hooks/**`、`src/composables/**`） | `overview.md`（组件 / hooks 清单）+ `flows.md`（页面交互流） |
+| 新增/修改前端状态模块（store / slice / context）或路由表 | `data-model.md`（状态结构）+ `flows.md`（路由与导航流） |
+| 新增/修改包 `exports` / 公共类型声明（`publishForm=npm-package`）或前端请求封装（`http-consumer`） | `interface.md`（export 子路径 / 所消费接口的请求响应映射） |
 
 写入规则：
 - **追加变更记录**，不覆盖已有内容
@@ -432,8 +443,8 @@ modules:
     desc: {模块职责一句话描述}
     template_probe_url: ""            # 文档文档链接（可选，init 时由用户提供或 init 自动创建后写入）
     entrypoints:
-      - type: gateway          # gateway（HTTP）| thrift（Thrift RPC）| mq | scheduled
-        class: {ClassName}     # @ThriftServerPublisher 实现类名（不含包路径）
+      - type: gateway          # gateway（HTTP）| thrift（Thrift RPC）| mq | scheduled | component | hook | store | export | route
+        class: {ClassName}     # Java：@ThriftServerPublisher 实现类名（不含包路径）；前端：组件 / hooks / composables / 状态模块 / 包 exports 子路径 / 路由表文件的相对路径（task_done / feature_done Step 1 第 2 条用它与 changed_files 做精确 / 前缀匹配）
       - type: mq
         topic: {topic-name}
         role: producer         # producer | consumer

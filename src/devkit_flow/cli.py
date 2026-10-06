@@ -7,13 +7,17 @@ from devkit_flow.config import command_review_gate_configure, command_review_gat
 from devkit_flow.e2e import command_e2e_configure, command_e2e_status, evaluate_e2e_gate
 from devkit_flow.errors import DevkitFlowError
 from devkit_flow.flow import command_feature_init, command_feature_next_id, command_flow_accept_risk, command_flow_archive, command_flow_complete, command_flow_confirm, command_flow_migrate_steps, command_flow_mode, command_flow_next, command_flow_rollback, command_flow_set, command_flow_task_ensure_small, command_flow_task_set, command_flow_verify, command_template
+from devkit_flow.flow_batch import command_flow_batch_set
 from devkit_flow.lint import command_lint
 from devkit_flow.parse_util import parse_status_file, status_path_for_feature
+from devkit_flow.project_detect import command_project_detect
+from devkit_flow.rule_sources import command_project_rules
 from devkit_flow.review import command_design_template_configure, command_design_template_status, command_review_rounds_check, command_review_rounds_configure, command_review_rounds_reset, command_review_rounds_status, command_review_rounds_tick
+from devkit_flow.review_result import command_review_result_verify
 from devkit_flow.session_registry import command_sessions_list, latest_marker
 from devkit_flow.setup import command_doctor, command_setup
 from devkit_flow.status_cmd import command_status
-from devkit_flow.switches import command_dashboard_configure, command_dashboard_status, command_docs_curator_configure, command_docs_curator_status, command_html_ui_configure, command_html_ui_status, command_spec_artifacts_configure, command_spec_artifacts_status, command_specrules_configure, command_specrules_refresh, command_specrules_status
+from devkit_flow.switches import command_dashboard_configure, command_dashboard_status, command_docs_curator_configure, command_docs_curator_status, command_html_ui_configure, command_html_ui_status, command_progress_bar_configure, command_progress_bar_status, command_spec_artifacts_configure, command_spec_artifacts_status, command_specrules_catalog_configure, command_specrules_catalog_status, command_specrules_configure, command_specrules_refresh, command_specrules_status
 from devkit_flow.textio import compact_error, emit
 from devkit_flow.workflow_auto import command_workflow_configure, command_workflow_status
 
@@ -231,6 +235,11 @@ def _dispatch_write_side_effects(
     emitter = None
     emitter_key = None
     explicit_ones = _cli_will_explicit_ones_sync(command, events)
+    failed_event_ids: list[str] = []
+    saw_receipt_events = any(
+        isinstance(event, dict) and isinstance(event.get("event_id"), str) and event.get("event_id")
+        for event in events
+    )
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -278,12 +287,29 @@ def _dispatch_write_side_effects(
                 # D-11/R2-N2（批次 1 审查 MAJOR-01 收口）：回放 flow_emit_event 写入的
                 # event["trace"]（v2 可选段，dict 形态），由 _build_envelope 注入信封；
                 # 缺省/None 时行为不变。
-                emitter.enqueue_event_safe(
-                    str(event_type), event_payload, feature_ref, trace=event.get("trace")
-                )
+                # 016 T-10（§4.7.2.3 第 9 步）：flow batch-set 事件携带确定性 event_id（uuid5），原样透传；
+                # 其余事件不带该键，调用形态与此前一致（event_id 缺省 → uuid4）。
+                event_id = event.get("event_id")
+                if isinstance(event_id, str) and event_id:
+                    # D-57②：带确定性 event_id 的批量事件用检查型入队，失败计入回执（不得视为成功）。
+                    enqueue_error = emitter.enqueue_event_checked(
+                        str(event_type), event_payload, feature_ref, trace=event.get("trace"),
+                        event_id=event_id,
+                    )
+                    if enqueue_error is not None:
+                        failed_event_ids.append(event_id)
+                else:
+                    emitter.enqueue_event_safe(
+                        str(event_type), event_payload, feature_ref, trace=event.get("trace")
+                    )
                 enqueued_any = True
         except Exception:
-            pass
+            event_id = event.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                failed_event_ids.append(event_id)
+    if saw_receipt_events:
+        # D-57②：派发回执（私有键，flow batch-set 在 emit 前取走）；单步命令的事件不带 event_id，输出形状不变。
+        result["_dispatch_receipts"] = {"telemetry_failed_event_ids": failed_event_ids}
     # D-10：只入队未 flush 的写命令，按节流条件异步拉起唯一后台 flusher（主路径不等待、不触网）。
     if enqueued_any and not flushed_any:
         try:
@@ -467,6 +493,8 @@ def _dispatch_flow(args: Any) -> int | None:
         return command_flow_next(args)
     if args.flow_command == "set":
         return command_flow_set(args, dashboard_refresh=refresh_dashboard_after_write, gate_guard=evaluate_e2e_gate, side_effects=_side_effects_for(args, command="flow set"))
+    if args.flow_command == "batch-set":
+        return command_flow_batch_set(args, dashboard_refresh=refresh_dashboard_after_write, gate_guard=evaluate_e2e_gate, side_effects=_side_effects_for(args, command="flow batch-set"))
     if args.flow_command == "accept-risk":
         return command_flow_accept_risk(args, dashboard_refresh=refresh_dashboard_after_write, side_effects=_side_effects_for(args, command="flow accept-risk"))
     if args.flow_command == "task":
@@ -554,6 +582,11 @@ def main() -> int:
                 return command_specrules_configure(args)
             if args.specrules_command == "refresh":
                 return command_specrules_refresh(args)
+            if args.specrules_command == "catalog":
+                if args.specrules_catalog_command == "status":
+                    return command_specrules_catalog_status(args)
+                if args.specrules_catalog_command == "configure":
+                    return command_specrules_catalog_configure(args)
         if args.command == "design-template":
             if args.design_template_command == "status":
                 return command_design_template_status(args)
@@ -561,6 +594,11 @@ def main() -> int:
                 return command_design_template_configure(args)
         if args.command == "html-ui":
             result = _dispatch_html_ui(args)
+        if args.command == "progress-bar":
+            if args.progress_bar_command == "status":
+                return command_progress_bar_status(args)
+            if args.progress_bar_command == "configure":
+                return command_progress_bar_configure(args)
         if args.command == "spec-artifacts":
             if args.spec_artifacts_command == "status":
                 return command_spec_artifacts_status(args)
@@ -577,10 +615,18 @@ def main() -> int:
                 return command_review_rounds_tick(args)
             if args.review_rounds_command == "reset":
                 return command_review_rounds_reset(args)
+        if args.command == "review-result":
+            if args.review_result_command == "verify":
+                return command_review_result_verify(args)
         if args.command == "template":
             return command_template(args)
         if args.command == "lint":
             return command_lint(args)
+        if args.command == "project":
+            if args.project_command == "detect":
+                return command_project_detect(args)
+            if args.project_command == "rules":
+                return command_project_rules(args)
         if args.command == "self-update":
             return _dispatch_self_update(args)
         if args.command in {"upgrade", "runtime", "migrate", "plugin", "session-mark"}:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 from devkit_flow.embedded import embedded_template_names
-from devkit_flow.constants import CANONICAL_RUNTIME_ORDER, FEEDBACK_DEFAULT_ASSIGNEE, FEEDBACK_HELP, FLOW_MODES, FLOW_STEP_STATES, FLOW_TASK_STATES, HTML_UI_HELP, PIPELINE_SCALE_STEPS, REVIEW_ROUNDS_HELP, SPEC_ARTIFACTS_HELP, SPECRULES_HELP
+from devkit_flow.constants import CANONICAL_RUNTIME_ORDER, FEEDBACK_DEFAULT_ASSIGNEE, FEEDBACK_HELP, FLOW_MODES, FLOW_STEP_STATES, FLOW_TASK_STATES, HTML_UI_HELP, PIPELINE_SCALE_STEPS, PROGRESS_BAR_HELP, REVIEW_ROUNDS_HELP, SPEC_ARTIFACTS_HELP, SPECRULES_HELP
 from devkit_flow.version import VERSION
 
 _TELEMETRY_SPAN_WORKER_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
@@ -49,6 +49,31 @@ def add_no_ones_sync_argument(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip automatic ONES follow-up after the local write. Does not affect explicit ones sync.",
     )
+
+
+_UUID_TEXT_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def flow_batch_op_id(value: str) -> str:
+    """016 T-10（D-51⑥ / Codex P2-11）：--op-id 必须是 8-4-4-4-12 形式的 UUID（与结果 schema 的 opId 口径一致），
+    原样保留大小写（幂等键按字面比较）。"""
+    text = str(value).strip()
+    if not _UUID_TEXT_RE.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"--op-id must be a UUID (8-4-4-4-12 hex), got {value!r}")
+    return text
+
+
+class FlowBatchMemberAction(argparse.Action):
+    """016 T-10（接口 §2.1）：``--step`` / ``--task`` 共用一个有序成员列表，保留命令行出现顺序（成员按此顺序求值）。"""
+
+    def __init__(self, option_strings, dest, member_kind: str = "step", **kwargs):  # type: ignore[no-untyped-def]
+        self.member_kind = member_kind
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[no-untyped-def]
+        members = list(getattr(namespace, self.dest, None) or [])
+        members.append((self.member_kind, str(values)))
+        setattr(namespace, self.dest, members)
 
 
 def add_feedback_draft_arguments(parser: argparse.ArgumentParser, *, submit: bool) -> None:
@@ -321,6 +346,30 @@ def parse_args() -> argparse.Namespace:
     specrules_url.add_argument("--repo-url", metavar="GIT-URL")
     specrules_url.add_argument("--use-default-repo", action="store_true")
     specrules_configure.add_argument("--format", choices=("json", "text"), default="text")
+    # 016 T-05：规则源 catalog（接口 §2.4）。只写配置 / 只读预览，挂载在下一次 setup。
+    specrules_catalog = specrules_subparsers.add_parser(
+        "catalog",
+        help="Show or configure rule-source catalog (frontend / java-backend) and routing; applied by the next setup.",
+    )
+    specrules_catalog_subparsers = specrules_catalog.add_subparsers(dest="specrules_catalog_command", required=True)
+    specrules_catalog_status = specrules_catalog_subparsers.add_parser(
+        "status",
+        help="Show catalog layers, routing mode/source and a read-only binding preview (no mount, no pull).",
+    )
+    specrules_catalog_status.add_argument("--format", choices=("json", "text"), default="text")
+    specrules_catalog_configure = specrules_catalog_subparsers.add_parser(
+        "configure",
+        help="Write ruleSources catalog / routing / module bindings into config (no mount; run setup to apply).",
+    )
+    specrules_catalog_configure.add_argument("--scope", choices=("global", "project"), default="project")
+    specrules_catalog_configure.add_argument("--kind", choices=("frontend", "java-backend"))
+    specrules_catalog_configure.add_argument("--repo-url", metavar="GIT-URL")
+    specrules_catalog_configure.add_argument("--remove", action="store_true")
+    specrules_catalog_configure.add_argument(
+        "--routing", choices=("auto", "legacy"), help="Project only: auto = adopt new routing; legacy = keep/return to old path."
+    )
+    specrules_catalog_configure.add_argument("--module", metavar="RELPATH", help="Project only: explicit module binding.")
+    specrules_catalog_configure.add_argument("--format", choices=("json", "text"), default="text")
 
     design_template = subparsers.add_parser(
         "design-template",
@@ -385,6 +434,29 @@ def parse_args() -> argparse.Namespace:
     html_ui_preview.add_argument("--feature", default=None)
     html_ui_preview.add_argument("--no-open", action="store_true")
     html_ui_preview.add_argument("--format", choices=("json", "text"), default="text")
+
+    progress_bar = subparsers.add_parser(
+        "progress-bar",
+        help=PROGRESS_BAR_HELP,
+        description=PROGRESS_BAR_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    progress_bar_subparsers = progress_bar.add_subparsers(dest="progress_bar_command", required=True)
+    progress_bar_status = progress_bar_subparsers.add_parser(
+        "status", help="Show the effective progress bar switch."
+    )
+    progress_bar_status.add_argument("--format", choices=("json", "text"), default="text")
+    progress_bar_configure = progress_bar_subparsers.add_parser(
+        "configure",
+        help="Enable, disable, inherit, or clear the progress bar switch.",
+    )
+    progress_bar_configure.add_argument("--scope", choices=("global", "project"), default="project")
+    progress_bar_action = progress_bar_configure.add_mutually_exclusive_group(required=True)
+    progress_bar_action.add_argument("--enable", action="store_true")
+    progress_bar_action.add_argument("--disable", action="store_true")
+    progress_bar_action.add_argument("--inherit", action="store_true")
+    progress_bar_action.add_argument("--clear", action="store_true")
+    progress_bar_configure.add_argument("--format", choices=("json", "text"), default="text")
 
     spec_artifacts = subparsers.add_parser(
         "spec-artifacts",
@@ -475,6 +547,24 @@ def parse_args() -> argparse.Namespace:
     review_rounds_reset.add_argument("--feature", default=None)
     review_rounds_reset.add_argument("--step", required=True, help=REVIEW_STEP_ALIAS_HELP)
     review_rounds_reset.add_argument("--format", choices=("json", "text"), default="text")
+
+    # 016 T-11（接口 §2.6）：审查机器结果文件校验。
+    review_result = subparsers.add_parser(
+        "review-result",
+        help="Verify a review report against its machine result file (review-<kind>.result.json).",
+    )
+    review_result_subparsers = review_result.add_subparsers(dest="review_result_command", required=True)
+    review_result_verify = review_result_subparsers.add_parser(
+        "verify",
+        help="Check schema, evidence, score and Markdown consistency; legacy reports without a result file are unverified (exit 0).",
+    )
+    review_result_verify.add_argument("--feature", default=None)
+    review_result_verify.add_argument(
+        "--report",
+        required=True,
+        help="design | apidoc | arch (review-arch-comprehensive.md) | arch:<T-xx> (review-arch-<T-xx>.md) | <path> (relative to cwd).",
+    )
+    review_result_verify.add_argument("--format", choices=("json", "text"), default="text")
 
     feature = subparsers.add_parser("feature", help="Manage feature spec directories.")
     feature_subparsers = feature.add_subparsers(dest="feature_command", required=True)
@@ -650,6 +740,61 @@ def parse_args() -> argparse.Namespace:
     add_no_ones_sync_argument(flow_set)
     flow_set.add_argument("--format", choices=("json", "text"), default="text")
 
+    flow_batch_set = flow_subparsers.add_parser(
+        "batch-set",
+        help="Set several pipeline steps and design tasks (D-xx) atomically under one STATUS.md lock.",
+    )
+    flow_batch_set.add_argument("--feature", default=None)
+    flow_batch_set.add_argument(
+        "--step",
+        dest="batch_members",
+        action=FlowBatchMemberAction,
+        member_kind="step",
+        default=None,
+        metavar="STEP_ID",
+        help="Pipeline step member (repeatable; -H human gates are not allowed). " + PIPELINE_STEP_ALIAS_HELP,
+    )
+    flow_batch_set.add_argument(
+        "--status",
+        default=None,
+        help="Target state shared by every --step member (flow set states except waived). Required with --step.",
+    )
+    flow_batch_set.add_argument(
+        "--task",
+        dest="batch_members",
+        action=FlowBatchMemberAction,
+        member_kind="task",
+        default=None,
+        metavar="D-xx=STATE",
+        help="Design task member as D-xx=<state> (repeatable; T-xx development tasks are not allowed).",
+    )
+    flow_batch_set.add_argument(
+        "--confirm-gates",
+        action="store_true",
+        help="Required when any task member is set to 已完成.",
+    )
+    flow_batch_set.add_argument(
+        "--note",
+        default=None,
+        help="Note for every non-noop member: replaces step notes, appends to task notes.",
+    )
+    flow_batch_set.add_argument(
+        "--op-id", dest="op_id", default=None, type=flow_batch_op_id, help="Idempotency key (uuid); derived when omitted."
+    )
+    flow_batch_set.add_argument(
+        "--expect-revision",
+        dest="expect_revision",
+        default=None,
+        help="Optimistic concurrency: sha256 of STATUS.md the caller last read.",
+    )
+    flow_batch_set.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and evaluate in memory only; no lock, no write, no events.",
+    )
+    add_no_ones_sync_argument(flow_batch_set)
+    flow_batch_set.add_argument("--format", choices=("json", "text"), default="text")
+
     flow_accept_risk = flow_subparsers.add_parser(
         "accept-risk",
         help="Accept unresolved design-review or task-architecture risks without falsifying PASS.",
@@ -744,7 +889,11 @@ def parse_args() -> argparse.Namespace:
 
     lint = subparsers.add_parser(
         "lint",
-        help="Run heuristic static checks (naming/layers/di) against a target Java repo.",
+        help="适用于 Java 模块：Run heuristic static checks (naming/layers/di) against a target Java repo.",
+        description=(
+            "适用于 Java 模块；非 Java 模块（前端 / Node 等）不调用 lint naming/layers/di。"
+            " Run heuristic static checks (naming/layers/di) against a target Java repo."
+        ),
     )
     lint_subparsers = lint.add_subparsers(dest="lint_command", required=True)
     for lint_group, lint_help in (
@@ -769,6 +918,52 @@ def parse_args() -> argparse.Namespace:
             help="Restrict to specific rule id(s) within the group; repeatable.",
         )
         lint_group_parser.add_argument("--format", choices=("json", "text"), default="text")
+
+    project = subparsers.add_parser(
+        "project",
+        help="Read-only project profile commands (stack detection).",
+    )
+    project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_detect = project_subparsers.add_parser(
+        "detect",
+        help=(
+            "Detect project/module stack from manifests and config files. Read-only: never runs "
+            "repository scripts, imports user code or touches the network."
+        ),
+    )
+    project_detect.add_argument("--path", default=".", help="Target directory (default: current directory).")
+    project_detect.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore the profile cache and always run detection.",
+    )
+    project_detect.add_argument(
+        "--write-cache",
+        action="store_true",
+        help="Write the detected profile to ~/.devkit/cache/project-profiles/ (default: no write).",
+    )
+    project_detect.add_argument("--format", choices=("json", "text"), default="text")
+    project_rules = project_subparsers.add_parser(
+        "rules",
+        help=(
+            "Print the effective rule_context (routing, per-module binding, rule closure). Read-only: never "
+            "mounts, switches sources, pulls or writes caches."
+        ),
+    )
+    project_rules.add_argument("--path", default=".", help="Workspace directory (default: current directory).")
+    project_rules.add_argument(
+        "--module",
+        default=None,
+        metavar="<id>",
+        help="Only output this module (relative path, root is '.'); default: all modules.",
+    )
+    project_rules.add_argument(
+        "--stage",
+        choices=("design", "coding"),
+        default="coding",
+        help="Closure stage (default: coding).",
+    )
+    project_rules.add_argument("--format", choices=("json", "text"), default="text")
 
     flow_complete = flow_subparsers.add_parser(
         "complete",
@@ -1095,6 +1290,14 @@ def parse_args() -> argparse.Namespace:
         help="Emit a SessionStart hook envelope; never blocks session startup.",
     )
     runtime_check.add_argument("--timeout-seconds", type=int, default=10)
+    runtime_check.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Check the experimental lifecycle root written by --force "
+            "install/update instead of the formal root (R-25, BC-09)."
+        ),
+    )
     runtime_check.add_argument("--format", choices=("json", "text"), default="text")
 
     runtime_session_end = runtime_subparsers.add_parser(
@@ -1160,6 +1363,14 @@ def parse_args() -> argparse.Namespace:
     runtime_recover.add_argument("--runtime", required=True, metavar="<runtime>")
     runtime_recover.add_argument("--transaction-id", default=None, metavar="<uuid>")
     runtime_recover.add_argument("--timeout-seconds", type=int, default=10)
+    runtime_recover.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Recover a transaction under the experimental lifecycle root "
+            "written by --force install/update (R-25, BC-09)."
+        ),
+    )
     runtime_recover.add_argument("--format", choices=("json", "text"), default="text")
 
     migrate = subparsers.add_parser(
@@ -1237,7 +1448,6 @@ def parse_args() -> argparse.Namespace:
     session_mark.add_argument("--transcript-path", default=None)
     session_mark.add_argument("--format", choices=("json", "text"), default="json")
 
-
     args = parser.parse_args()
     if args.command == "specrules" and args.specrules_command == "configure":
         has_switch = bool(args.enable or args.disable or args.follow_global)
@@ -1247,4 +1457,28 @@ def parse_args() -> argparse.Namespace:
                 "one of the arguments --enable --disable --follow-global "
                 "--repo-url --use-default-repo is required"
             )
+    if (
+        args.command == "specrules"
+        and args.specrules_command == "catalog"
+        and args.specrules_catalog_command == "configure"
+        and args.repo_url is None
+        and not args.remove
+        and args.routing is None
+        and args.module is None
+    ):
+        specrules_catalog_configure.error("one of the arguments --repo-url --remove --routing --module is required")
+    if args.command == "flow" and args.flow_command == "batch-set":
+        members = args.batch_members or []
+        if not members:
+            flow_batch_set.error("at least one of the arguments --step --task is required")
+        if any(kind == "step" for kind, _ in members) and not args.status:
+            flow_batch_set.error("the argument --status is required when --step is given")
+    if (
+        args.command == "telemetry"
+        and getattr(args, "telemetry_command", None) == "flush"
+        and getattr(args, "background", False)
+        and getattr(args, "replay_quarantine", False)
+    ):
+        # 016 D-65④：组合无效，直接报参数错误（argparse 口径 exit 2），不静默忽略 replay。
+        telemetry_flush.error("argument --replay-quarantine: not allowed with argument --background")
     return args

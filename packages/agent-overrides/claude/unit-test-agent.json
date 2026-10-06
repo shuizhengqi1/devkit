@@ -1,6 +1,6 @@
 {
   "frontmatter": {
-    "description": "单元测试编写专家（Java/JUnit 4/Mockito）。输入为被测试类路径与 feature 上下文；先分析真实代码结构与依赖，再按规范编写单测，最后编译运行验证覆盖率 ≥80%。由 feature-dev-manager-agent 在开发任务实现完成后调用。use proactively。",
+    "description": "单元测试编写专家（框架以项目既有依赖与生效规则为准：Java 用仓库既有 JUnit 4 或 JUnit 5 + Mockito，非 Java 按画像 testRunner）。输入为被测试类/函数/组件路径与 feature 上下文；先分析真实代码结构与依赖，再按规范编写单测，最后编译运行验证覆盖率按生效规则阈值（Java 默认 80%）。由 feature-dev-manager-agent 在开发任务实现完成后调用。use proactively。",
     "tools": "Glob, Grep, LS, Read, Write, Edit, Bash, NotebookRead, WebFetch, TodoWrite, WebSearch"
   }
 }

@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Any
 from devkit_flow.constants import RUNTIME_PLUGIN_NAME
 from devkit_flow.errors import DevkitFlowError
-from devkit_flow.textio import compact_error, current_cli_path
+from devkit_flow.textio import compact_error, current_cli_path, runtime_support_root
 from devkit_flow.version import VERSION
 
 
@@ -20,15 +19,9 @@ def codex_agent_registry(plugin_root: Path | None = None) -> Any:
     """Load shipped support from either a source checkout or the npm package."""
     cli_dir = current_cli_path().parent
     source_root = cli_dir.parent.parent if cli_dir.name == "devkit_flow" and cli_dir.parent.name == "src" else None
-    support_candidates = [cli_dir / "runtime-support", cli_dir.parent / "scripts"]
-    if source_root is not None:
-        support_candidates.append(source_root / "scripts")
-    support = next((path for path in support_candidates
-                    if (path / "codex_agent_registry" / "__init__.py").is_file()), None)
+    support = runtime_support_root("codex_agent_registry", current_cli_path())
     if support is None:
         raise DevkitFlowError("Codex agent registration support is missing; reinstall devkit-flow")
-    if str(support) not in sys.path:
-        sys.path.insert(0, str(support))
     from codex_agent_registry import Registry
     if plugin_root is None:
         payload_candidates = [

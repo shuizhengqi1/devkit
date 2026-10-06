@@ -11,7 +11,7 @@ If `allowed=false` or `loop_status=human_required`, stop auto re-review and wait
 
 Round 1 must still be single-pass complete (`findings_complete`). Do not call Codex native `/review`. Do not treat the configured round cap as the primary review strategy.
 
-「自动推进」covers already-accepted Red/Green/Coverage only. It does **not** include accept-risk, `threat_model_expansion`, or a new full-scope review.
+「自动推进」covers the shared-body S5 continuous-execution contract only (Red/Green/Coverage/Refactor and the next task dispatch within the S5-H authorization; pauses only on the closed 7-code list, recorded as `[pause:<code>]`). It does **not** include accept-risk, `threat_model_expansion`, or a new full-scope review. Deferring a `preexisting_missed` / `threat_model_expansion` finding is a manager decision recorded outside the result file (accept-risk + `DECISIONS.md` entry); never edit `review-*.result.json`.
 
 If the user says 不管了 / 跳过这个架构问题 / 继续 feature while task-architecture is blocked or `human_required`, run:
 

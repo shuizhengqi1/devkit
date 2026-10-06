@@ -1,4 +1,6 @@
-在启动或继续 Feature 前，先确认全局 `devkit-flow --version` 可用，执行
+在启动或继续 Feature 前，先确认全局 `devkit-flow --version` 可用，并按主文「旧 CLI 回退守卫」判定
+（能力探测：`devkit-flow project rules --help` 退出码非 0 且存在 `.devkit/specrules-binding.json` 时
+跳过 `setup` 与 `specrules refresh`（也不 `feature init`）、逐字输出 §6.2 回退警示并按 `env-error` 暂停；退出码 0 视为路由感知 CLI）；未命中时执行
 `devkit-flow setup --target "$PWD"` 与 `devkit-flow doctor --target "$PWD"`；
 `setup` 只维护工作区数据，不安装项目级 CLI。新建 feature 前再执行
 `devkit-flow specrules refresh --target "$PWD"`：已挂载远端 specrules 时自动更新，
@@ -38,7 +40,7 @@ Plugin SessionStart Hook 只做 `runtime check` 只读诊断：有更新时提�
 
 当遇到**澄清、用户补充、变更请求、开发后发现需要回写设计/任务/上下文**时，优先调用 `devkit:change-impact-analyzer-agent` 读取 feature 现有产物并更新 `CHANGELOG.md`，再根据其中的建议 agent / 建议回退步骤继续路由。不要由主线程自己通读三类设计文档做完整影响分析。
 
-**不要在每个步骤开始前都向用户请求确认。**当当前 feature 已确定且下一步可执行时，应直接继续并汇报进度，而不是先问“是否开始/是否继续”。但以下情况必须打断用户并等待答复：① 同时存在多个进行中的 feature 需要用户选择；② 创建新 feature 缺少必要输入；③ worker 明确回报存在阻塞或必须澄清的问题；④ `S2-H` 方案人工确认；⑤ `S5-H` 开发执行确认；⑥ 回滚、取消、结束 feature 这类破坏性或终结性操作。**没有 S5-H 确认时，禁止调用 `dev-task-executor-agent`。**
+**不要在每个步骤开始前都向用户请求确认。**当当前 feature 已确定且下一步可执行时，应直接继续并汇报进度，而不是先问“是否开始/是否继续”。S5-H `done` 后按共享正文硬约束 10 的 **S5 连续执行契约**：每个任务关闭后在同一回合汇报并直接派发下一任务，直到任务表全部完成再进入 S5-R / S5-E2E / S5.7；Red / Green / Coverage / Refactor 不再向用户索要确认。只有共享正文的闭合暂停清单（7 码）允许打断用户：① 同时存在多个进行中的 feature 需要用户选择、② 创建新 feature 缺少必要输入、③ worker 回报阻塞或澄清问题，且所缺输入**必要且无法从源码 / 文档 / 项目画像获得** → `input-missing`（可自行调研取得的信息由 manager 先调研补齐后重派；可修复失败在同任务内修复，均不暂停）；④ `S2-H` 方案人工确认、⑤ `S5-H` 开发执行确认、accept-risk 及首任务走查确认 → `human-gate`；⑥ 回滚、取消、结束 feature 这类破坏性或终结性操作 → `user-stop` / `scope-change`；另有 `review-rounds-blocked` / `host-limit` / `env-error`。暂停时经 `flow set --note` / `flow task set --note` 写 `[pause:<码>] <原因>; done=<已完成任务>; resume=<恢复入口>`；恢复会话（含 compact 后）读 STATUS / `task.md`，S5-H 已 `done` 即不重复索要授权，只执行未完成任务。**没有 S5-H 确认时，禁止调用 `dev-task-executor-agent`。**
 
 调用 worker 时，优先让其**直接写入目标文件并只回传精简结果**：`status`、产物路径、问题摘要、必要的 blocker/clarification。**不要**要求 worker 在返回消息中复制大段文档正文、长篇代码片段或完整分析过程，以免这些内容重新占满主线程上下文。
 

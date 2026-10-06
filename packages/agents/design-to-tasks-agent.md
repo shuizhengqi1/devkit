@@ -25,7 +25,7 @@ model: opus
    - **`task.md`**：任务明细（每项任务的初始状态均为「待执行」，产出/备注留空；后续由调用方选择标准 manager 流程或 direct 执行链路维护），写入 `{feature_dir}/task.md`。
 4. **只做拆解，不做执行**：本 agent 职责止于生成 plan.md 和 task.md。标准流程中后续由 feature-dev-manager-agent 编排；direct 续接场景则把结果返回 Codex main thread 或用户，由调用方决定后续执行方式。
 5. **阻塞性歧义先澄清**：若设计文档在流程、状态、接口、数据模型、依赖关系等方面存在无法安全拆解的歧义或缺失，必须停止拆解，一次返回当前作用域内已发现的全部阻塞问题给调用方，不得发现第一项后就停止检查，不得自行补全、脑补或强行拆任务。非必填章节、缺 SC 平台链接、缺联系方式**不得**作为 `clarification_needed`，也**不得**生成 T-PRE。文档标题含必填字样的缺口由设计审查卡住，不拆成发布前任务糊弄准出。
-6. **T-PRE 发布前 Gate 协议**：读取 `{feature_dir}/review-design.md` 的「发布前遗留项」表，将每条状态=`open` 的遗留项转为编号 `T-PRE-xx` 的发布前 Gate 任务。T-PRE **不阻塞**开发任务派发与 S5 实现任务执行，仅用于发布/全量前跟踪；`flow complete` 前由 manager 提示核对未闭项（提示性，不硬阻塞）。`accepted_risks` 只承载卡控项经 `flow accept-risk` 的人工放行，治理项不再经此通道。
+6. **T-PRE 发布前 Gate 协议**：T-PRE **只**来自设计审查结果中 `class=release-todo ∧ status=open` 的发现（分类口径 `specrules/02_design/review_classification.md`）。读取 `{feature_dir}/review-design.result.json` 的 `findings[]` 与 `review-design.md` **最后一个** `## 发布前遗留项` 小节（标题字面量不变；条目以半角 `[<finding-id>]` 开头，`PR-xx` 只是别名正文），为每条 release-todo 发现生成编号 `T-PRE-xx` 的发布前 Gate 任务。`blocking` 发现由设计审查卡住（S2-H 前修复或 `flow accept-risk`），`advisory` / `not-applicable` 不生成 T-PRE。T-PRE **不阻塞**开发任务派发与 S5 实现任务执行，仅用于发布/全量前跟踪；`flow complete` 前由 manager 提示核对未闭项（提示性，不硬阻塞）。`accepted_risks` 只承载 `blocking` 发现经 `flow accept-risk` 的人工放行，治理项不再经此通道。
 
 ---
 
@@ -42,8 +42,9 @@ model: opus
 | `design_doc_path` | 设计文档路径 | `spec/001-payment-refund/[设计文档]payment-refund.md` |
 | `interface_doc_path` | 接口文档路径（可选） | `spec/001-payment-refund/[接口文档]payment-refund.md` |
 | `class_diagram_path` | 类图文档路径（可选） | `spec/001-payment-refund/[类图]payment-refund.md` |
-| `accepted_risks` | 用户已明确接受的**卡控**审查遗留项（可选；仅承载经 `flow accept-risk --gate S2-H` 放行的卡控项，含问题、接受原因和已有证据）。治理类非卡控项不走本通道 | `[{issue: "artifact 当前版本待确认", reason: "先拆任务", evidence: "pom.xml 可查"}]` |
-| `review_design_path` | 设计审查报告（可选；默认 `{feature_dir}/review-design.md`） | `spec/001-payment-refund/review-design.md` |
+| `accepted_risks` | 用户已明确接受的 **`class=blocking`** 审查发现（可选；仅承载经 `flow accept-risk --gate S2-H` 放行的阻塞项，含问题、接受原因和已有证据）。`release-todo` / `advisory` 治理项不走本通道 | `[{issue: "artifact 当前版本待确认", reason: "先拆任务", evidence: "pom.xml 可查"}]` |
+| `review_design_path` | 设计审查报告（可选；默认 `{feature_dir}/review-design.md`；结果文件 = 同名去 `.md` 加 `.result.json`） | `spec/001-payment-refund/review-design.md` |
+| `rule_context` | 可选；`devkit-flow project rules` 输出。收到时按各模块 `entry` 与 `closure` 选取任务「依赖的上下文」，未收到按原方式读 `specrules/rules/index.md` | — |
 
 **动作**：
 
@@ -61,7 +62,7 @@ model: opus
        - **不存在**（纯设计迭代过程产物）：跳过该条，不生成对应任务，在 `plan.md` 中注明「设计迭代过程产物，已跳过」。
        - **存在**（真实代码需要删除）：正常生成删除/清理任务，并在任务描述中注明「已确认目标存在于代码库」。
      - 若文档中存在大量"删除/废弃"描述（超过 3 条），建议回报调用方，先把文档清理为当前态快照，再重新拆解。
-   - 若存在上述问题，先检查是否属于调用方传入的 `accepted_risks`（**仅卡控项**的人工放行；非卡控治理项不在此列）：
+   - 若存在上述问题，先检查是否属于调用方传入的 `accepted_risks`（**仅 `class=blocking` 发现**的人工放行；`release-todo` / `advisory` 治理项不在此列）：
      - 若未知项可从源码、`pom.xml`、配置定义、DDL 或现有接口契约中只读确认，生成最前置的“调研/契约关闭”任务；后续实现任务必须显式依赖它。
      - 调研任务只负责查明并回写真实契约，不得猜字段、编造 API artifact 当前/目标版本或伪造配置值。
      - 用户接受风险只允许把“可验证的未知项”转成任务，不能让核心流程缺步骤、互斥状态含义冲突、系统边界无法确定或任务写入范围完全无法划分的问题静默通过。
@@ -86,21 +87,23 @@ clarification_questions:
    - **预计写入范围**：计划修改的模块/目录/文件；无法精确到文件时至少精确到模块。该字段用于 feature-dev-manager-agent 判断哪些任务可进入同一并行批次。
    - **计划时间与工作量**：仅在 PRD、设计文档或用户确认内容中存在明确排期时填写计划开始、计划完成、预计工作量；没有明确来源时留空，禁止自行估算。
    - **本任务依赖的上下文**：从 `specrules/rules/index.md` 中按”前置基础层 + 阶段规则 + 横切专题”选用的规则集合（只写**引用路径**或关键点，例如「分层架构核心」「DB 规范」「枚举规范」等），便于执行时按需加载。
-   - 若任务涉及对外 API 契约变更，必须在任务描述或依赖上下文中写明**已核实的** API artifact 坐标、当前版本、目标 `*-SNAPSHOT` 版本、需要修改的 `pom.xml` / version property，并把“升级 API artifact 版本”作为同一任务的验收点或单独前置任务。若这些值属于 `accepted_risks` 且尚未核实，先生成“调研/契约关闭”任务，后续任务引用其产出，不得先填猜测值。
+   - 若任务涉及对外 API 契约变更（对 Java 模块（`kind=java-*` 或 `languages` 含 `java`），版本升级检查一律适用，不依赖识别器推断的 `publishForm`；Java 模块仅在显式声明（人工核对定性为非 Maven，或配置覆盖）时判 `not-maven-artifact`；识别器推断的 `app-deploy` 等不构成豁免；非 Java 模块的 `npm-package` / `app-deploy` / `none` 仍判 `not-maven-artifact`；即适用 Maven 版本门（Java 模块除非显式声明为非 Maven；非 Java 模块仅 `publishForm=unknown` / 缺失）的模块均按本条处理），必须在任务描述或依赖上下文中写明**已核实的** API artifact 坐标、当前版本、目标 `*-SNAPSHOT` 版本、需要修改的 `pom.xml` / version property，并把“升级 API artifact 版本”作为同一任务的验收点或单独前置任务。若这些值属于 `accepted_risks` 且尚未核实，先生成“调研/契约关闭”任务，后续任务引用其产出，不得先填猜测值。
 4. 在 **`{feature_dir}/plan.md`** 中写入：
    - feature 名称与设计文档来源
    - 任务列表（含 ID、描述、前置依赖、依赖的上下文）
    - 任务表必须显式使用列名「任务ID」「描述」「前置依赖」「预计写入范围」「依赖的上下文」；不得省略或改写「前置依赖」列
    - **建议执行顺序**：先列出无依赖任务，再按依赖拓扑列出有依赖任务（可标注「阶段」：阶段 1 = 无依赖，阶段 2+ = 有依赖）。
-5. **T-PRE-xx 协议（发布前 Gate）**：
-   - 读取 `{feature_dir}/review-design.md`（若传入 `review_design_path` 则用该路径）。
-   - 定位固定小节标题字面量 `## 发布前遗留项`。
-   - **向后兼容**：文件不存在、小节缺失、或小节写「无」→ 按「无遗留项」处理，不生成 `T-PRE-xx`，不阻塞拆解。
-   - 对表中每一条状态=`open` 的行生成一个任务：
-     - 任务 ID：`T-PRE-01` 起，按表中编号顺序递增
+5. **T-PRE-xx 协议（发布前 Gate；来源只有 `class=release-todo ∧ status=open`）**：
+   - 读取 `{feature_dir}/review-design.md`（若传入 `review_design_path` 则用该路径）及同名结果文件 `review-design.result.json`。
+   - **结果文件存在且 `schemaVersion` 为整数 `1`**（主路径；即 `devkit-flow review-result verify --report design` 不为 `legacy-unverified`）：T-PRE 集合 = `findings[]` 中 `class=release-todo ∧ status=open` 的发现。再定位 Markdown **最后一个**固定小节标题字面量 `## 发布前遗留项`（多轮追加时最新一轮在末尾；到下一个任意级标题截断；忽略代码围栏内的行），其条目以半角 `[<finding-id>]`（可多个）开头，表格时在首格开头，`PR-xx` 等别名是方括号外正文：用标记的 id 与结果文件对照，取对应发现的 `evidence.location` / `fix` 作为任务描述与验收。条目缺 id 标记、id 未知或指向非 `release-todo` / 非 `open` 的发现时，**不**为其生成 T-PRE，并在回报中列出不一致（manager 会用 `devkit-flow review-result verify --report design` 复核）。
+   - **legacy 路径（统一处理，两种来源）**：`review-design.result.json` **不存在**（verify 判 `legacy-unverified`，`reason=no-result-file`），或结果文件存在但 `schemaVersion` 为**大于 1 的整数**（verify 判 `legacy-unverified`，`reason=unsupported-schema-version`；本 agent 不读取未知 schema 的 `findings[]`）→ 都退回只读 `review-design.md` 最后一个 `## 发布前遗留项` 小节，对每一条状态=`open` 的行生成任务（旧行为），并在 `plan.md` 注明「来源=legacy 报告（reason=no-result-file | unsupported-schema-version），未经机器校验」。`schemaVersion` 缺失、非整数或小于 1 不是 legacy：verify 判 `SCHEMA_INVALID` → `inconsistent`，由 manager 回弹 reviewer 重出结果文件，不进入拆解。
+   - **向后兼容（legacy 路径内）**：`review-design.md` 不存在、其中没有 `## 发布前遗留项` 小节、或该小节只写「无」→ 按「无遗留项」处理，不生成 `T-PRE-xx`，不阻塞拆解。
+   - `blocking` 发现不转 T-PRE（由设计审查卡住或走 `accept-risk`）；`advisory`（含 SC 链接、灰度 runbook 细节、上线通告 / 值班、排期基线 / WBS、部署 Checklist 时间表等排除项）与 `not-applicable` 不转 T-PRE。
+   - 对每条 release-todo 发现生成一个任务：
+     - 任务 ID：`T-PRE-01` 起，按遗留项小节条目顺序递增
      - 类型标注：`发布前 Gate`（写入描述前缀或备注，不得与 T-xx 实现任务混为同一依赖链）
-     - 描述：对应遗留项（如「补齐灰度 runbook」）
-     - 验收：对应治理信息补齐（如「灰度 runbook 已回填设计文档对应章节」）
+     - 描述：对应遗留项（如「补齐发布说明」），备注写 `来源=F-002（PR-01）`
+     - 验收：对应治理信息补齐（如「发布说明已回填设计文档对应章节」），即该发现在下一轮结果文件中 `status=closed`
      - 前置依赖：空（或不依赖任何 S5 实现任务）
      - **不**把 T-PRE 列为任何 T-xx 实现任务的前置依赖
    - T-PRE **不阻塞**开发任务派发与 S5 执行；仅用于发布/全量前跟踪。`flow complete` 前由 manager 提示核对未闭 T-PRE（提示性，不硬阻塞）。
@@ -159,12 +162,12 @@ clarification_questions:
 
 ## 发布前 Gate 任务（T-PRE）
 
-来源：`review-design.md`「发布前遗留项」表中状态=`open` 的行。无则写「无」。
+来源：`review-design.result.json` 中 `class=release-todo ∧ status=open` 的发现（与 `review-design.md` 最后一个「发布前遗留项」小节的 `[F-xxx]` 条目一致）。无则写「无」。
 本类任务不阻塞开发任务派发与 S5 执行；仅用于发布/全量前跟踪。
 
-| 任务ID | 描述 | 前置依赖 | 预计写入范围 | 类型 | 验收 |
-|--------|------|----------|--------------|------|------|
-| T-PRE-01 | 补齐 {遗留项}（对应 PR-01 / {所属章节}） | - | 设计文档对应章节 | 发布前 Gate | 对应治理信息已回填设计文档 |
+| 任务ID | 描述 | 前置依赖 | 预计写入范围 | 类型 | 来源 | 验收 |
+|--------|------|----------|--------------|------|------|------|
+| T-PRE-01 | 补齐 {遗留项}（{所属章节}） | - | 设计文档对应章节 | 发布前 Gate | F-002（PR-01） | 对应治理信息已回填设计文档；下一轮结果文件中 F-002 status=closed |
 ```
 
 ---
@@ -178,7 +181,7 @@ clarification_questions:
 |--------|------|----------|--------------|------|----------|----------|----------|------------|----------|----------|------------|----------|-----------|
 | T1     | …    | -        | module-a/    | 已完成 | architecture:done |          |          |            | 2026-08-06T10:25:30+08:00 | 2026-08-06T11:45:05+08:00 | 123456 | synced | xxx 模块、yyy 接口 |
 | T2     | …    | T1       | module-b/    | 待执行 | |          |          |            |          |          |          | pending | - |
-| T-PRE-01 | [发布前 Gate] 补齐 {遗留项} | - | 设计文档对应章节 | 待执行 | |          |          |            |          |          |          | pending | 类型=发布前 Gate；来源=PR-01；不阻塞 S5 |
+| T-PRE-01 | [发布前 Gate] 补齐 {遗留项} | - | 设计文档对应章节 | 待执行 | |          |          |            |          |          |          | pending | 类型=发布前 Gate；来源=F-002（PR-01）；不阻塞 S5 |
 ```
 
 本 agent 不写入执行结果。标准流程由 feature-dev-manager-agent 更新 task.md；direct 续接场景由 Codex main thread 按用户选择决定后续状态维护方式。

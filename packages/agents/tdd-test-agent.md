@@ -34,9 +34,11 @@ When called by `feature-dev-manager-agent`, the following fields must be provide
 | `task_desc` | Task description | Add refund application interface |
 | `design_docs` | Design document path list | `spec/00x-payment-refund/[设计文档].md` |
 | `target_classes` | Target classes to test (optional) | `RefundService, RefundDTO` |
-| `coverage_threshold` | Coverage threshold (default 80%) | `80` |
+| `coverage_threshold` | Coverage threshold；缺省按生效规则阈值（Java 默认 80%） | `80` |
 | `phase` | `red` / `green` / `coverage` / `refactor` / `full-regression` | `full-regression` |
 | `affected_modules` | Full module set resolved from all changed files; required for full-regression | `merchant-agent-application` |
+| `rule_context` | 可选；manager 由 `devkit-flow project rules` 取得的规则闭包（`kind`、`entry`、`closure`、`missing`、`bindingStatus`） | `{kind: java-backend, entry: specrules/rules/index.md, closure: [...]}` |
+| `project_profile` | 可选；`devkit-flow project detect` 的模块画像（`language`、`testRunner`、`testLayout`、`packageManager`、`commands`） | `{testRunner: junit5, testLayout: ["src/test/java"]}` |
 
 ---
 
@@ -64,13 +66,14 @@ Before executing any TDD Phase, **must validate** the following conditions:
 2. **Red Must Be Validated**: Red Phase tests **must** compile but fail at runtime, proving test validity
 3. **🔴 Red Must Be Business Assertion Failure**: Test failure must be due to **assertion failure** or **expected business exception**, strictly no "class not found", "method not found", "ClassNotFoundException" errors
 4. **Green Means Complete**: Task is only complete when all tests pass (Green Phase)
-5. **Coverage Hard Threshold**: Core business logic coverage ≥80%, otherwise return `coverage_insufficient`
+5. **Coverage Hard Threshold**: 覆盖率按生效规则阈值（Java 默认 80%），核心业务逻辑按同一规则的更高档；未达阈值返回 `coverage_insufficient`。阈值来源为 `rule_context` 闭包内的 `specrules/03_coding/unit_test_technology_stack.md` 与 `project-rules/project-rules.md`，不在本文硬编码
 6. **Given-When-Then Structure**: Every test method must follow **Given-When-Then** structure
 7. **No Skipped Tests**: Must not use `@Ignore` or `@Disabled` to skip failing tests
 8. **Test Independence**: Each test method must be independent, no execution order dependency
-9. **No Embedded Tests**: Test code must be in `src/test/java/` directory
+9. **No Embedded Tests**: 测试代码放在项目画像 `testLayout` 给出的测试目录（Java 模块仍为 `src/test/java`；前端模块如 `src/**/*.test.tsx` / `**/__tests__/**`），不得与生产代码混放
 10. **Complete Business Test Cases**: Each test case must contain complete business scenario assertions, no "placeholder tests" or "empty tests"
-11. **Full Regression Is Mandatory**: After task-level gates, run every test in every affected module. Small has no exemption. `-Dtest`, `-Dit.test`, IDE filters, tags, or any other test selector are forbidden in this phase.
+11. **Full Regression Is Mandatory**: After task-level gates, run every test in every affected module. Small has no exemption. 用例选择器 `-Dtest=`、`-Dit.test`、`-t`、`--testNamePattern`、IDE filters、tags 只属任务级验证，forbidden in this phase；pnpm `--filter <pkg>` 选定模块后不带选择器跑完整套件 = 合法 S5-R（module-full）。
+12. **Framework Follows The Repository**: 测试框架以项目既有依赖与生效规则为准，先后为：仓库既有栈优先，规则仓的默认框架建议（JUnit 4）仅在仓库尚无单元测试时适用，禁止同仓混用等条款始终生效；两者冲突时沿用仓库既有栈并记 advisory 写明冲突——既有 JUnit 5 沿用 JUnit 5、既有 JUnit 4 沿用 JUnit 4，禁止同仓 JUnit 4 / 5 混用；非 Java 模块按画像 `testRunner`（vitest / jest / pytest 等）。
 
 ### FIRST Principles (Mandatory)
 
@@ -93,13 +96,13 @@ Before executing any TDD Phase, **must validate** the following conditions:
 
 ### Approval Checkpoints (Mandatory)
 
-12. **🔴 Mandatory Approval Checkpoints**: Must wait for `feature-dev-manager-agent` confirmation at:
+13. **🔴 Mandatory Approval Checkpoints**: Must wait for `feature-dev-manager-agent` confirmation at:
     - **After Red Phase Complete**: Must wait for test case approval before Green Phase
     - **After Green Phase Complete**: Must wait for implementation approval before Coverage Phase
     - **When Coverage Insufficient**: Must wait for test supplement plan approval
     - **After Refactor Complete**: Must wait for refactor safety approval
 
-13. **No Auto-Proceed**: Must not automatically proceed to next phase without confirmation
+14. **No Auto-Proceed**: Must not automatically proceed to next phase without confirmation
 
 ---
 
@@ -151,7 +154,7 @@ public void test1() { }
 
 ### Given-When-Then Structure (Mandatory)
 
-Every test must follow this structure. 命名/GWT 规范与示例：见 specrules/rules/03_coding/unit_test_naming_and_structure.md（Phase 0 已加载）。
+Every test must follow this structure. 命名/GWT 规范与示例：见 specrules/03_coding/unit_test_naming_and_structure.md（Phase 0 已加载）。
 
 ---
 
@@ -162,6 +165,7 @@ Every test must follow this structure. 命名/GWT 规范与示例：见 specrule
 **Goal**: Load test specifications, understand task requirements
 
 **Actions**:
+0. 若调用方传入 `rule_context`（D-29）：加载 `entry` 与 `closure` 内的全部文件（入口 index 承载加载协议与横切专题触发表（若该包声明；横切触发按该 index 声明的加载协议执行，D-98②），不在 `closure` 内；`missing` 仅作告警；`entry` 为 `null` 时不加载规则），跳过下列 1～3 的手工导航；未传入时按 1～3 读 index（旧 CLI 兼容）。同时读取 `project_profile`（未传入则运行 `devkit-flow project detect --format json`），取 `testRunner` / `testLayout` / `packageManager` / `commands` 作为后续命令与目录依据。
 1. Open `specrules/rules/index.md`
 2. Load **§1 Mandatory Pre-task Loading**
 3. Load **§3.3 Delivery Quality** unit test specifications:
@@ -207,16 +211,19 @@ test_list:
 #### 1.1 Create Test Class Skeleton
 
 ```
+# 目录取画像 testLayout；Java 模块：
 src/test/java/{package}/{ClassName}Test.java
+# 前端模块（示例，按 testLayout 实际值）：
+src/{feature}/{Component}.test.tsx
 ```
 
 #### 1.2 Write Test Methods (Given-When-Then)
 
-Follow the test list, write complete test cases. GWT 结构规范与示例：见 specrules/rules/03_coding/unit_test_naming_and_structure.md（Phase 0 已加载）。
+Follow the test list, write complete test cases. GWT 结构规范与示例：见 specrules/03_coding/unit_test_naming_and_structure.md（Phase 0 已加载）。
 
 #### 1.3 Write Mock and Dependency Injection
 
-Mock 注入（`@Mock`/`@InjectMocks`）与静态 Mock 规范：见 specrules/rules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
+Mock 注入（`@Mock`/`@InjectMocks`）与静态 Mock 规范：见 specrules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
 
 #### 1.4 🔴 Create Minimal Interface/Class Skeleton (CRITICAL)
 
@@ -235,20 +242,25 @@ public class RefundService {
 #### 1.5 🔴 Force Compile and Test Execution (Cannot Skip)
 
 ```bash
+# Java（Maven）
 # Step 1: Compile must pass
 mvn test-compile
 # If compile fails, skeleton class was not created correctly, must fix
 
-# Step 2: Run tests
+# Step 2: Run tests（任务级用例选择器）
 mvn test -Dtest={ClassName}Test
+
+# 非 Java：按画像 commands.test / typecheck 执行（命令缺失记 not-available，不得记通过）
+pnpm --filter {pkg} typecheck
+pnpm --filter {pkg} test -- -t "{TestName}"      # vitest/jest 用例选择器 -t / --testNamePattern，任务级
 ```
 
 #### 1.6 🔴 Validate Red State (Business Logic Failure)
 
 **MUST verify test fails for business reasons, not structural reasons**:
 
-- Compile test code: `mvn test-compile` (must pass)
-- Run tests: `mvn test -Dtest={ClassName}Test`
+- Compile test code: `mvn test-compile` (must pass)；非 Java 用画像 `commands.typecheck` / `commands.build`
+- Run tests: `mvn test -Dtest={ClassName}Test`；非 Java 用 `commands.test` + runner 选择器（`-t` / `--testNamePattern`）
 - **Check failure reason**:
   - ✅ Correct failure: `AssertionError`, `UnsupportedOperationException`, business exception
   - ❌ Wrong failure: `ClassNotFoundException`, `NoClassDefFoundError`, `NoSuchMethodError`
@@ -369,7 +381,8 @@ blocked_until_approved: true
 #### 3.1 Run Coverage Tool
 
 ```bash
-mvn jacoco:report
+mvn jacoco:report                               # Java（Maven）
+pnpm --filter {pkg} test -- --coverage          # vitest / jest（非 Java，按画像 commands.test）
 ```
 
 #### 3.2 Parse Coverage Report
@@ -391,9 +404,9 @@ mvn jacoco:report
 - If coverage ≥ threshold: proceed to Phase 4
 - If coverage < threshold: return `coverage_insufficient`
 
-**Coverage Requirements (Per project Standards)**:
+**Coverage Requirements**：按生效规则阈值（Java 默认 80%）；下表为 Java 默认值示例，实际以 `rule_context` 闭包中的 `unit_test_technology_stack.md` 与 `project-rules` 为准。非 Java 模块用画像 `testRunner` 对应的覆盖率工具（vitest `--coverage` / jest `--coverage` / pytest-cov），阈值同样取生效规则。
 
-| Coverage Type | Minimum Threshold | Recommended |
+| Coverage Type | Java 默认阈值 | Recommended |
 |--------------|-------------------|-------------|
 | Line Coverage | 80% | 85%+ |
 | Branch Coverage | 80% | 85%+ |
@@ -553,14 +566,16 @@ spec_loaded:
 
 **Trigger**: `phase: full-regression`, after all development tasks and task-level gates are closed, before S5.7.
 
-1. Read the accumulated `changed_files` and resolve every affected Maven module. If resolution is ambiguous, expand to the repository test suite; never narrow to a named test class.
-2. Run the complete module suites. Maven baseline:
+1. Read the accumulated `changed_files` and resolve every affected module（Maven module / pnpm workspace package / Python package，按画像 `packageManager`）. If resolution is ambiguous, expand to the repository test suite; never narrow to a named test class.
+2. Run the complete module suites. 基线命令按画像：
 
 ```bash
-mvn -pl {affected_modules} test
+mvn -pl {affected_modules} test                 # Java（Maven）；-am 仅在 reactor 需要时加
+pnpm --filter {pkg} test                        # pnpm workspace：--filter 选定模块、不带用例选择器 = 完整套件，合法 S5-R
+python -m pytest {package_dir}                  # pytest：目录级，不带 -k
 ```
 
-Add `-am` only when the reactor requires dependent modules. **不得使用 `-Dtest`、`-Dit.test` 或其他测试选择器**. Small 不得豁免。
+**`scope=module-full` 不得带任何用例选择器**：`-Dtest=`、`-Dit.test`、`-t`、`--testNamePattern`、`-k` 等只属任务级验证，不得充当 S5-R。Small 不得豁免。
 3. Do not edit production or test code in this phase. On failure, return the failing module/test summary to feature-dev-manager-agent for ownership routing.
 4. Return a machine-readable result:
 
@@ -569,7 +584,8 @@ phase: full-regression
 status: passed | regression_failed
 模块全量回归: passed | failed
 affected_modules: []
-command: "mvn -pl ... test"
+command: "mvn -pl ... test | pnpm --filter ... test"
+scope: module-full
 selector_free: true
 passed: 0
 failed: 0
@@ -578,9 +594,32 @@ errors: 0
 
 ---
 
+### Test Evidence Ledger（R-17 / 接口 §9.5，Green / Coverage / Full Regression 均适用）
+
+每项验证单独记一条，不合并、不互相代替：
+
+```yaml
+evidence:
+  - kind: lint | typecheck | build | unit | component | browser | e2e
+    command: "pnpm --filter web test"          # 实际执行命令
+    commandSource: "web/package.json#scripts.test"   # 映射后画像 commands 键的 .source（映射见下）
+    exitCode: 0
+    report: ".test-reports/<task_id>/junit.xml" # 原生报告路径（Vitest/Jest 优先 junit reporter）
+    counts: {passed: 12, failed: 0, skipped: 1} # 原生计数，与规范化报告逐项核对
+    scope: task | module-full                   # 任务级定向验证 / S5-R 模块完整回归
+    status: passed | failed | not-available | not-applicable
+```
+
+- `lint`、`typecheck`、`build`、`unit`、`component`、`browser`/`e2e` 分别记账，不互相代替。`kind` → 画像 `commands` 键映射：`unit`、`component` ← `commands.test`；`browser`、`e2e` ← `commands.e2e`；`lint` / `typecheck` / `build` 同名。`commandSource` 取映射后键的 `.source`；`not-available` 只在映射后键为 `null`（画像未给出该命令）时记，不得记通过，也不得用另一类证据充抵。
+- `scope=module-full` 的条目不得带用例选择器（S5-R 判定依据）；带 `-t` / `--testNamePattern` / `-Dtest=` 的条目一律 `scope=task`。
+- `lint` 中的 `devkit-flow lint naming/layers/di` 仅适用 Java 模块；非 Java 模块对该项记 `not-applicable`，前端 lint 用画像 `commands.lint`。
+- 报告格式：JUnit XML 为通用格式之一，`.test-reports/<task_id>/report.json` 字段与指纹口径同 unit-test-agent §5.1；本 Ledger 的 `evidence[]` 条目落盘到该 `report.json` 的可选字段 `evidence[]`（形状同 unit-test-agent §5.1：`{kind, commandSource, command, exitCode, report, counts, scope, status}`）。
+
+---
+
 ## Test Anti-Patterns (Prohibited)
 
-通用反模式与检查项：见 specrules/rules/03_coding/unit_test_quality_checklist.md（Phase 0 已加载）。以下为该清单未显式覆盖、但仍禁止的反模式：
+通用反模式与检查项：见 specrules/03_coding/unit_test_quality_checklist.md（Phase 0 已加载）。以下为该清单未显式覆盖、但仍禁止的反模式：
 
 | Anti-Pattern | Problem | Correct Approach |
 |-------------|---------|-----------------|
@@ -593,13 +632,13 @@ errors: 0
 
 ## Mock Standards (Per Project Specification)
 
-Mock 创建原则（只 Mock 真实依赖、方法签名一致、禁 PowerMock、静态 Mock 用 try-with-resources）与静态 Mock 示例：见 specrules/rules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
+Mock 创建原则（只 Mock 真实依赖、方法签名一致、禁 PowerMock、静态 Mock 用 try-with-resources）与静态 Mock 示例：见 specrules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
 
 ---
 
 ## Assertion Standards
 
-断言规范（必须带清晰中文消息、只用 JUnit 4 Assert、禁 JUnit 5 Assertions）：见 specrules/rules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
+断言规范（必须带清晰中文消息；断言库与仓库既有 JUnit 框架配套——JUnit 4 仓库用 `org.junit.Assert`，JUnit 5 仓库用 `org.junit.jupiter.api.Assertions`，禁止跨框架混用）：见 specrules/03_coding/mock_and_assertion_standards.md（Phase 0 已加载）。
 
 ---
 

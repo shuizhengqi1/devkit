@@ -31,7 +31,7 @@ from devkit_flow.telemetry_spans import (
     SessionTokenSummarizer,
 )
 from devkit_flow.templates_md import LEGACY_WORKSPACE_ROUTING_TEMPLATE, PRE_WORKFLOW_LEGACY_WORKSPACE_ROUTING_TEMPLATE, WORKSPACE_ROUTING_TEMPLATE
-from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, maybe_check_latest_update, sha256_file, version_tuple
+from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, maybe_check_latest_update, runtime_support_root, sha256_file, version_tuple
 from devkit_flow.version import NPM_PACKAGE_NAME, VERSION
 from devkit_flow.workflow_auto import merge_auto_takeover, workflow_session_notice_line
 
@@ -474,6 +474,7 @@ def command_runtime_check(args: argparse.Namespace) -> int:
             operation="check",
             runtime=args.runtime,
             fmt="json",
+            force=getattr(args, "force", False),
             timeout_seconds=getattr(args, "timeout_seconds", 10),
             stdout=buffer,
         )
@@ -1550,16 +1551,10 @@ RUNTIME_UPDATERS = {
 
 
 def runtime_lifecycle_support() -> Path:
-    """定位 runtime lifecycle 支撑树（源码仓 scripts/ 或发行包 runtime-support/）。"""
-    candidates = [
-        current_cli_path().parent / "runtime-support",
-        current_cli_path().parent.parent / "scripts",
-    ]
-    for candidate in candidates:
-        if (candidate / "runtime_cli").is_dir():
-            if str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-            return candidate
+    """定位 runtime lifecycle 支撑树（发行包 runtime-support/、源码仓 scripts/ 或 python -m 源码态）。"""
+    support = runtime_support_root("runtime_cli", current_cli_path())
+    if support is not None:
+        return support
     raise DevkitFlowError(
         "runtime lifecycle support payload is missing; reinstall devkit-flow "
         "or run from the source repository"
@@ -1643,19 +1638,98 @@ def _upgrade_child_error_code(child: dict[str, Any]) -> str | None:
     return codes[0] if codes else None
 
 
+# 016 T-19（T-17 转入）：`upgrade --runtime all` 下 pi 的 registry 预检拒绝
+# （R-27，E_ARTIFACT_NOT_FOUND @ stage=preflight）不得因 aggregate 把所有
+# preflight 失败标成 hostSupported=false 而被静默计为 skipped。
+# 016 T-26（D-72，与 D-67 同口径）：未完成事务的预检拒绝（E_RECOVERY_REQUIRED
+# @ stage=preflight）同样阻断——需先显式 recover，不得计为 skipped。
+_UPGRADE_PREFLIGHT_BLOCKING_ERROR_CODES = frozenset({"E_ARTIFACT_NOT_FOUND", "E_RECOVERY_REQUIRED"})
+UPGRADE_OUTCOME_SUCCESS = "success"
+UPGRADE_OUTCOME_SKIPPED = "skipped"
+UPGRADE_OUTCOME_FAILED = "failed"
+UPGRADE_OUTCOME_PREFLIGHT_FAILED = "preflight-failed"
+
+
+def _upgrade_child_preflight_failure(child: dict[str, Any]) -> dict[str, Any] | None:
+    """沿 error.cause 链找 stage=preflight 且错误码属于阻断集合的一层。"""
+    error = child.get("error")
+    depth = 0
+    while isinstance(error, dict) and depth < 32:
+        if (
+            error.get("stage") == "preflight"
+            and error.get("errorCode") in _UPGRADE_PREFLIGHT_BLOCKING_ERROR_CODES
+        ):
+            return error
+        error = error.get("cause")
+        depth += 1
+    return None
+
+
 def _upgrade_child_skippable(child: dict[str, Any]) -> bool:
+    """宿主不可用类失败是否可跳过。
+
+    只在 ``upgrade_child_outcome`` 判过 ``_upgrade_child_preflight_failure``
+    之后调用（阻断性预检失败优先，不在此重复判定——T-19 P2-4 单一判定点）。
+    """
     if child.get("hostSupported") is False:
         return True
     return bool(_UPGRADE_SKIPPABLE_ERROR_CODES.intersection(_upgrade_error_codes(child)))
 
 
+def upgrade_child_outcome(child: dict[str, Any]) -> str:
+    """单个 runtime 子结果的归类：success / skipped / preflight-failed / failed。"""
+    status = child.get("status")
+    if status == "success":
+        return UPGRADE_OUTCOME_SUCCESS
+    if _upgrade_child_preflight_failure(child) is not None:
+        return UPGRADE_OUTCOME_PREFLIGHT_FAILED
+    if _upgrade_child_skippable(child):
+        return UPGRADE_OUTCOME_SKIPPED
+    if status == "failed" or _upgrade_error_codes(child):
+        return UPGRADE_OUTCOME_FAILED
+    return UPGRADE_OUTCOME_SUCCESS
+
+
+def upgrade_runtime_outcomes(results: list[Any]) -> list[dict[str, Any]]:
+    """`runtime_outcomes` 字段：每个 runtime 的归类、最内层错误码 / stage / detail。"""
+    outcomes: list[dict[str, Any]] = []
+    for raw in results:
+        if not isinstance(raw, dict):
+            continue
+        outcome = upgrade_child_outcome(raw)
+        innermost: dict[str, Any] | None = None
+        error = raw.get("error")
+        depth = 0
+        while isinstance(error, dict) and depth < 32:
+            innermost = error
+            error = error.get("cause")
+            depth += 1
+        entry: dict[str, Any] = {
+            "runtime": str(raw.get("runtime") or "unknown"),
+            "outcome": outcome,
+            "errorCode": (innermost or {}).get("errorCode"),
+            "stage": (innermost or {}).get("stage"),
+            "detail": _upgrade_child_detail(raw) if outcome != UPGRADE_OUTCOME_SUCCESS else None,
+        }
+        outcomes.append(entry)
+    return outcomes
+
+
 def _upgrade_child_detail(child: dict[str, Any]) -> str:
+    """最内层原因优先（016 T-19，R-26 初衷）：沿 error.cause 链取最深一层的
+    非空 detail（如 pi 宿主命令诊断），而不是外层 E_OPERATION_ROLLED_BACK 的
+    固定文案；整条链都没有 detail 时回退 message / status。"""
     error = child.get("error")
-    while isinstance(error, dict):
-        detail = error.get("detail")
-        if detail:
-            return str(detail)
+    detail = ""
+    depth = 0
+    while isinstance(error, dict) and depth < 32:
+        candidate = error.get("detail")
+        if candidate:
+            detail = str(candidate)
         error = error.get("cause")
+        depth += 1
+    if detail:
+        return detail
     return str(child.get("message") or child.get("status") or "")
 
 
@@ -1669,12 +1743,10 @@ def classify_upgrade_children(
     for raw in results:
         if not isinstance(raw, dict):
             continue
-        status = raw.get("status")
-        if status == "success":
-            succeeded.append(raw)
-        elif _upgrade_child_skippable(raw):
+        outcome = upgrade_child_outcome(raw)
+        if outcome == UPGRADE_OUTCOME_SKIPPED:
             skipped.append(raw)
-        elif status == "failed" or _upgrade_error_codes(raw):
+        elif outcome in (UPGRADE_OUTCOME_FAILED, UPGRADE_OUTCOME_PREFLIGHT_FAILED):
             blocking.append(raw)
         else:
             succeeded.append(raw)
@@ -1708,12 +1780,17 @@ def render_upgrade_message(
             continue
         runtime = str(child.get("runtime") or "unknown")
         detail = _upgrade_child_detail(child)
-        if child.get("status") == "success":
+        outcome = upgrade_child_outcome(child)
+        if outcome == UPGRADE_OUTCOME_SUCCESS:
             variant = child.get("resultVariant") or "success"
             suffix = f" — {detail}" if detail else ""
             lines.append(f"- {runtime}: {variant}{suffix}")
-        elif _upgrade_child_skippable(child):
+        elif outcome == UPGRADE_OUTCOME_SKIPPED:
             lines.append(f"- {runtime}: skipped — {detail}")
+        elif outcome == UPGRADE_OUTCOME_PREFLIGHT_FAILED:
+            preflight = _upgrade_child_preflight_failure(child) or {}
+            code = preflight.get("errorCode") or "E_ARTIFACT_NOT_FOUND"
+            lines.append(f"- {runtime}: preflight-failed — {code}: {detail}")
         else:
             lines.append(f"- {runtime}: failed — {detail}")
     return "\n".join(lines)
@@ -1830,6 +1907,12 @@ def command_upgrade_lifecycle(args: argparse.Namespace) -> int:
             "runtime": args.runtime,
             "cli": cli_result,
             "runtime_update": runtime_document,
+            # 016 T-19：每个 runtime 的归类（success / skipped /
+            # preflight-failed / failed）与最内层错误；pi registry 预检失败在
+            # all 下记 preflight-failed 并阻断，不再静默计为 skipped
+            "runtime_outcomes": upgrade_runtime_outcomes(
+                results if isinstance(results, list) else []
+            ),
         },
         args.format,
     )

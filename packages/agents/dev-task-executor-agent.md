@@ -24,6 +24,8 @@ model: opus
 | `task_desc` | 任务描述（一句话 + 可选详情） | 新增退款申请接口 |
 | `spec_context` | 该任务依赖的规范路径列表（来自 plan.md） | `specrules/00_general/architecture/api_layer_standards.md` |
 | `check_standard` | 验收条件（可选） | 完成实现并进入后续架构审查 |
+| `rule_context` | 可选；manager 由 `devkit-flow project rules` 取得的规则闭包（`kind`、`entry`、`closure`、`excluded`、`missing`、`bindingStatus`、`profileDigest`） | `{kind: java-backend, entry: specrules/rules/index.md, closure: [...]}` |
+| `project_profile` | 可选；`devkit-flow project detect` 的模块画像（`language`、`publishForm`、`contractRoles`、`testLayout`、`commands`） | `{language: java, publishForm: maven-artifact}` |
 
 > ⚠️ 禁止一次传入多条任务或整个 task.md，避免上下文过长导致规范加载和审查质量下降。
 
@@ -39,12 +41,13 @@ model: opus
 
 ### 2. 加载规范
 
+- **收到 `rule_context` 时（D-29）**：只加载 `entry` 与 `closure` 内的文件（入口 index 承载加载协议与横切专题触发表（若该包声明），不在 `closure` 内；`missing` 仅作告警；`entry` 为 `null` 时不加载规则），`closure` 已按阶段与模块画像（languages / classifications / contractRoles）过滤，不再手工按 §1～§3 导航；横切触发仍按下文 D-98② 条款执行。未收到 `rule_context` 时按下列步骤读 index（旧 CLI 兼容）。
 - 打开 **`specrules/rules/index.md`**。
 - 先加载 **§1 任务前置必加载**。
 - 根据当前任务阶段继续加载：
   - 开发任务默认进入 **§3 开发阶段规则集合**
   - 若任务涉及设计返工或设计补充，再追加 **§2 设计阶段规则集合**
-- 再打开 `specrules/rules/index.md` **§4 横切专题触发表**，按 **§6.3** 用本次 `task_desc` + 预计写入范围/`changed_files` 逐行匹配：命中则加载该行路径；未命中在回报的 `spec_loaded` 中写「不适用 + 未匹配的触发」。禁止凭记忆点名横切规范文件。任务自带的 `spec_context` 优先加载，触发表用于补漏。
+- 再打开规则入口 index。**横切触发按模块 entry index 声明的加载协议执行（D-98②）**：规则入口 index（有 `rule_context` 时为各模块 `entry`，mixed 仓逐模块；未收到时为 `specrules/rules/index.md`）含「横切专题触发表」章节（如根规则包 **§4 横切专题触发表**）时，按该表与该 index 声明的匹配算法（根规则包为 **§6.3**）用本次 `task_desc` + 预计写入范围/`changed_files` 逐行匹配：命中则加载该行路径（Java 根规则包下 Bean 创建权等横切规范经此触发）；未命中在回报的 `spec_loaded` 中写「不适用 + 未匹配的触发」；禁止凭记忆点名横切规范文件，禁止默默跳过整张表。该 index 没有「横切专题触发表」章节（如前端规则包的 §4 是「加载协议」）时，按该包加载协议的声明执行（前端规则包声明 `rule_context.closure` 即本次应加载的文件全集），在 `spec_loaded` 注明「该规则包无此章节（横切专题触发表）」，不阻塞；§6.3 等其他固定章节缺失同理，注明「该规则包无此章节（§6.3）」后按该包协议继续，不得因章节缺失回报 `failed` 或 `clarification_needed`。任务自带的 `spec_context` 优先加载，触发表用于补漏。
 - 按索引中的**引用路径**加载对应规范文件（只引用路径，不复制全文）；若任务跨多类（如既改 API 又改 Domain），则合并加载相关规则。
 - **项目级规范（补充加载）**：检查 `project-rules/project-rules.md` 是否存在：
   - 存在 → 读取并加载，作为对全局规范的补充（项目特有约定优先级高于全局规范中的通用建议）
@@ -57,7 +60,7 @@ model: opus
 - 结合 `task_desc`、`spec_context` 以及与本任务直接相关的设计文档/代码，只检查当前任务的实现前提，不做无关扩散。
 - 重点识别以下会直接影响编码正确性的阻塞性问题：
   - 接口契约、字段语义、状态流转条件缺失或存在多种解释
-  - 对外 API 契约（Gateway / Thrift / Request / Response / DTO / Enum）有新增或字段/方法调整，但设计文档或任务未明确 API artifact 的 `groupId:artifactId`、当前版本、目标 `*-SNAPSHOT` 版本、需要修改的 `pom.xml` / version property
+  - 对外 API 契约有新增或字段/方法调整时，先按 `specrules/02_design/api_version_policy.md` 的影响分类判定（`no-contract-change` / `not-maven-artifact` 不要求升级；`unreleased-unconsumed` 须三证据齐备；`released-or-consumed` / `breaking` / `evidence-unknown` 需版本处置）。仅当模块适用 Maven 版本门（Java 模块除非显式声明为非 Maven；非 Java 模块仅 `publishForm=unknown` / 缺失）（Java API artifact：Gateway / Thrift / Request / Response / DTO / Enum）且分类要求升版时，设计文档或任务却未明确 `groupId:artifactId`、当前版本、目标 `*-SNAPSHOT` 版本、需要修改的 `pom.xml` / version property，才构成阻塞；契约角色（`http-provider` / `http-consumer` / `npm-public-package` / `internal-page` / `java-artifact`）与 `publishForm` 分开判定、可叠加：只有判为 `not-maven-artifact`（下句 D-102）时才不套用 Maven 要求，按各自契约角色判定兼容与 semver；Java `http-provider` 且未显式声明为非 Maven（识别器推断 `publishForm=app-deploy` 也一样）仍走上述 Maven 版本门。**Java 模块版本门（D-102，与 `api_version_policy.md` §2.1 第 1 步同句）**：对 Java 模块（`kind=java-*` 或 `languages` 含 `java`），版本升级检查一律适用，不依赖识别器推断的 `publishForm`；Java 模块仅在显式声明（人工核对定性为非 Maven，或配置覆盖）时判 `not-maven-artifact`；识别器推断的 `app-deploy` 等不构成豁免；非 Java 模块的 `npm-package` / `app-deploy` / `none` 仍判 `not-maven-artifact`。识别器推断的 `publishForm` 对 Java 模块只作信息记录（`app-deploy` 为信息性），Java 专项门控不读该推断；非 Java 模块 `publishForm=unknown` 或缺失仍按 Maven API artifact 处理。
   - 异常处理、边界条件、幂等/可见性规则未定义
   - 与外部系统/模块/存储/缓存/MQ 的交互方式不清晰
   - 数据映射、对象转换、落库语义、回调语义存在歧义
@@ -88,13 +91,15 @@ validation_result:      未执行（等待澄清）
 - 只有 `project-rules`、仓级说明或护栏测试明确行数上限时，才把该上限作为项目约束；超限拆分必须遵守
   `specrules/03_coding/dependency_injection_core.md` 的「Bean 创建权」与「安全拆分」：拆出协作类仍由 Spring 管理并使用
   `@Resource` 字段注入，禁止宿主 `new`、`lazy factory`、`new Foo(this, ...)`，禁止为 `@InjectMocks` 改生产装配。
-- 涉及 DB/MQ/API/枚举/对象转换/单元测试时，分别遵循 index（含 §4 命中行）中指向的对应子规范。
-- 若任务涉及对外 API 契约变更，必须同步更新对应 API artifact 的 Maven 版本：
+- 涉及 DB/MQ/API/枚举/对象转换/单元测试时，分别遵循 index（含横切触发命中行）中指向的对应子规范。
+- 若任务涉及对外 API 契约变更，且模块适用 Maven 版本门（Java 模块除非显式声明为非 Maven；非 Java 模块仅 `publishForm=unknown` / 缺失）（对 Java 模块（`kind=java-*` 或 `languages` 含 `java`），版本升级检查一律适用，不依赖识别器推断的 `publishForm`；Java 模块仅在显式声明（人工核对定性为非 Maven，或配置覆盖）时判 `not-maven-artifact`；识别器推断的 `app-deploy` 等不构成豁免；非 Java 模块的 `npm-package` / `app-deploy` / `none` 仍判 `not-maven-artifact`）、按 `specrules/02_design/api_version_policy.md` 分类为需升版（`released-or-consumed` / `breaking`，或 `evidence-unknown` 按前者处理），必须同步更新对应 API artifact 的 Maven 版本：
   - 优先修改统一版本来源（根 `pom.xml` 的 version property 或 `<dependencyManagement>`）
   - 若版本由 API 模块 `pom.xml` 直接声明，则修改 API 模块版本
-  - 目标版本必须为任务/设计文档中明确的 `*-SNAPSHOT`，禁止自行猜测
+  - 目标版本必须为任务/设计文档中明确的 `*-SNAPSHOT`（仅适用 Maven 版本门（Java 模块除非显式声明为非 Maven；非 Java 模块仅 `publishForm=unknown` / 缺失）的模块），禁止自行猜测
   - 若无法定位版本来源或发现目标版本缺失，立即回报 `clarification_needed`，不得继续实现
-- 若 §4 触发表命中对象转换行，按该行加载路径自检后再继续实现，不要另调对象转换 skill。
+  - `no-contract-change` / `not-maven-artifact`（显式声明为非 Maven 的 Java 模块，或非 Java 模块 `publishForm=npm-package` / `app-deploy` / `none`；识别器推断的 `app-deploy` 不构成豁免）不要求 Maven 升级；`npm-public-package` 按 semver 与 `exports` 兼容判定，`http-provider` / `http-consumer` 按接口兼容判定，`internal-page` 不涉及版本
+  - 不得以文件数、分支名、`-SNAPSHOT` 后缀推导分类（R-10）；分类结论与证据交由 manager / reviewer 记入审查结果，本 agent 在 `change_summary` 写明 `apiImpactClass` 与依据
+- 若横切触发命中对象转换行，按该行加载路径自检后再继续实现，不要另调对象转换 skill。
 
 ### 5. 本地自检（必做）
 
@@ -109,14 +114,15 @@ validation_result:      未执行（等待澄清）
 - **输出落盘一次、离线解析**：任何测试执行先把完整输出 tee 落盘到文件，统计从落盘文件离线解析；解析失败不得成为重跑理由（以 junit xml 为准）。
 - **产出测试报告**：完成本任务测试后，在目标仓产出 `.test-reports/<task_id>/`：
   - junit xml（测试框架原生报告）与 `report.json` 同目录；
-  - `report.json` 字段固定为 `{command, command_hash, fingerprint, exit_code, tests_run, failures, duration_ms, runner, created_at}`；
+  - `report.json` 字段固定为 `{command, command_hash, fingerprint, exit_code, tests_run, failures, duration_ms, runner, created_at}`；可选字段 `evidence[]`（向后兼容，形状同 unit-test-agent §5.1：`{kind, commandSource, command, exitCode, report, counts, scope, status}`）承载下文证据分账条目；
   - 指纹口径：`fingerprint = sha256(排序后的 design_files ∪ 测试文件 的 git blob hash + command_hash)`；任一声明文件内容或测试命令变化即失效，保守不遗漏（覆盖范围 = 任务声明的全部 design_files，不做 diff 猜测）；
   - 同 task_id 目录保留最近 5 次报告，更老的由本 agent 清理。
-- **静态前置 lint**：自检阶段运行 `devkit-flow lint`（命名 / 分层 / DI 三组，可 `lint all`）；BLOCKER 级 finding 必须清零后才可回报 done；WARNING 不阻断，但须在回报中给出数量。
+- **静态前置 lint**：自检阶段运行 `devkit-flow lint`（命名 / 分层 / DI 三组，可 `lint all`）；BLOCKER 级 finding 必须清零后才可回报 done；WARNING 不阻断，但须在回报中给出数量。`devkit-flow lint` 仅适用 Java 模块（D-26）；非 Java 模块对该项记 `not-applicable`，改用画像 `commands.lint` / `commands.typecheck`（缺失记 `not-available`，不得记通过）。
+- **证据分账（R-17）**：`lint` / `typecheck` / `build` / `unit` 各自记录命令、来源（`commandSource`）、退出码与报告路径，`scope=task`。`kind` → 画像 `commands` 键映射：`unit`、`component` ← `commands.test`；`browser`、`e2e` ← `commands.e2e`；`lint` / `typecheck` / `build` 同名。`commandSource` 取映射后键的 `.source`；`not-available` 只在映射后键为 `null`（画像未给出该命令）时记，不得记通过，也不得用另一类证据充抵。`-Dtest=` / `-t` / `--testNamePattern` 等用例选择器只用于任务级验证，S5-R 由 manager 另行派发。
 - **红线清单自检**：若派发输入携带 dispatch-redlines 条目，逐条对照预计写入范围与实际 changed_files 自检，并在回报中声明「红线 N 条，命中 0」或命中条目 id 清单。
 - **自检清单新增（缺一不得回报 done）**：
-  1. 报告文件存在性——`.test-reports/<task_id>/report.json` 与 junit xml 存在且字段齐全；
-  2. lint BLOCKER 清零。
+  1. 报告文件存在性——`.test-reports/<task_id>/report.json` 与 junit xml 存在且字段齐全（测试目录与 runner 取画像 `testLayout` / `testRunner`，Java 仍 `src/test/java`）；
+  2. lint BLOCKER 清零（Java 模块）或 `not-applicable`（非 Java 模块）。
 
 ### 6. 回报执行结果（禁止直接写 task.md）
 

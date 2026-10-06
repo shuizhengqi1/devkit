@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 from devkit_flow.embedded import embedded_templates
 from devkit_flow.constants import CANONICAL_DESIGN_TASKS, CLOSED_STATES, DESIGN_TASK_COLUMNS, DESIGN_TASK_SEPARATOR, DONE_STATES, INACTIVE_FEATURE_STATES, PIPELINE_TABLE_HEADER, PIPELINE_TABLE_SEPARATOR, SKIPPED_STATES, SMALL_TASK_HEADERS, TASK_SYNC_COLUMNS, WAIVED_STATES
 from devkit_flow.errors import DevkitFlowError
-from devkit_flow.textio import atomic_write_text
+from devkit_flow.textio import FlowStatusLockUnavailable, atomic_write_text, flow_status_write_lock
 
 
 def feature_name_from_dir(feature_dir: Path) -> str:
@@ -120,8 +123,21 @@ def find_features(workspace: Path) -> list[dict[str, Any]]:
     if not spec_root.is_dir():
         return []
 
+    # 不用 spec_root.glob("*/STATUS.md")：CPython 3.12 的 pathlib.glob 对字面量段 STATUS.md 也要 scandir 特性目录，
+    # 目录不可读（chmod 0300 / sandbox 禁读）时静默返回空；3.13 只 lstat 该字面量路径。这里固定为 3.13 语义：
+    # 列 spec/ 子目录，再对 <dir>/STATUS.md 做 lexists，排序与原 glob 结果一致，不依赖解释器版本。
+    # spec/ 本身不可列举时与原 glob 一致（两个解释器都吞掉 OSError）：返回空，不抛异常（R-24）。
+    try:
+        children = list(spec_root.iterdir())
+    except OSError:
+        return []
+    status_files = [
+        child / "STATUS.md"
+        for child in children
+        if child.is_dir() and os.path.lexists(child / "STATUS.md")
+    ]
     features: list[dict[str, Any]] = []
-    for status_file in sorted(spec_root.glob("*/STATUS.md")):
+    for status_file in sorted(status_files):
         features.append(parse_status_file(status_file, workspace))
     return features
 
@@ -210,6 +226,8 @@ def summarize_features(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "feature_dir": feature["feature_dir"],
             "state": feature["summary"]["state"],
             "current_step": feature["current_step"],
+            # 加性字段（D-24）：STATUS「分支」原值，缺失为空串；供进度条 mod 按当前 git 分支聚焦。
+            "branch": feature["summary"].get("branch", ""),
         }
         for feature in features
     ]
@@ -224,7 +242,15 @@ def task_path_for_feature(workspace: Path, feature: dict[str, Any]) -> Path:
 
 
 def set_status_field(path: Path, field_name: str, value: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
+    # 016 T-10（D-40）：字段写是「重读全文 → 改一行 → 原子写」，持 STATUS 锁即与表写入互斥
+    #（ONES需求ID / ONES同步 等 ONES 回写经此路径；外层已持锁时可重入）。
+    with flow_status_write_lock(path):
+        atomic_write_text(path, render_status_field_text(path.read_text(encoding="utf-8"), field_name, value))
+
+
+def render_status_field_text(text: str, field_name: str, value: str) -> str:
+    """016 T-09（§4.7.2.3）：内存版 ``set_status_field``，返回改写后的全文（不落盘）。"""
+    lines = text.splitlines()
     prefix = f"**{field_name}**:"
     replacement = f"{prefix} {value}"
     for index, line in enumerate(lines):
@@ -244,7 +270,7 @@ def set_status_field(path: Path, field_name: str, value: str) -> None:
             ),
         )
         lines.insert(insert_at, replacement)
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 def set_status_requirement_id(path: Path, requirement_id: str) -> None:
@@ -258,7 +284,12 @@ def set_status_ones_sync(path: Path, sync_state: str) -> None:
 def parse_task_table(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise DevkitFlowError(f"Task file not found: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    return parse_task_table_text(path.read_text(encoding="utf-8"), source=path)
+
+
+def parse_task_table_text(text: str, *, source: Path | str = "<memory>") -> dict[str, Any]:
+    """016 T-09：从内存文本解析任务表（``parse_task_table`` 的纯函数内核）。"""
+    lines = text.splitlines()
     header_index = -1
     headers: list[str] = []
     for index, line in enumerate(lines):
@@ -268,7 +299,7 @@ def parse_task_table(path: Path) -> dict[str, Any]:
             headers = cells
             break
     if header_index < 0:
-        raise DevkitFlowError(f"No task table found in {path}")
+        raise DevkitFlowError(f"No task table found in {source}")
 
     row_start = header_index + 2
     row_end = row_start
@@ -301,6 +332,11 @@ def parse_task_table(path: Path) -> dict[str, Any]:
 
 
 def save_task_table(path: Path, table: dict[str, Any]) -> None:
+    atomic_write_text(path, render_task_table_text(table))
+
+
+def render_task_table_text(table: dict[str, Any]) -> str:
+    """016 T-09：内存表 → task.md 全文（``save_task_table`` 的纯函数内核，不落盘）。"""
     headers: list[str] = table["headers"]
     rows: list[dict[str, str]] = table["rows"]
     rendered = [
@@ -314,7 +350,7 @@ def save_task_table(path: Path, table: dict[str, Any]) -> None:
     start = table["header_index"]
     end = table["row_end"]
     updated = lines[:start] + rendered + lines[end:]
-    atomic_write_text(path, "\n".join(updated) + "\n")
+    return "\n".join(updated) + "\n"
 
 
 def markdown_cell(value: str) -> str:
@@ -358,7 +394,12 @@ def write_new_small_task_file(path: Path, feature_name: str, row: dict[str, str]
 def parse_design_task_table(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise DevkitFlowError(f"Status file not found: {path}")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    return parse_design_task_table_text(path.read_text(encoding="utf-8"), source=path)
+
+
+def parse_design_task_table_text(text: str, *, source: Path | str = "<memory>") -> dict[str, Any]:
+    """016 T-09：从内存文本解析设计任务表（``parse_design_task_table`` 的纯函数内核）。"""
+    lines = text.splitlines()
     header_index = -1
     headers: list[str] = []
     for index, line in enumerate(lines):
@@ -368,7 +409,7 @@ def parse_design_task_table(path: Path) -> dict[str, Any]:
             headers = cells
             break
     if header_index < 0:
-        raise DevkitFlowError(f"No design task table found in {path}")
+        raise DevkitFlowError(f"No design task table found in {source}")
 
     row_start = header_index + 2
     row_end = row_start
@@ -399,6 +440,19 @@ def parse_design_task_table(path: Path) -> dict[str, Any]:
 
 
 def save_design_task_table(path: Path, table: dict[str, Any]) -> None:
+    if not path.exists():
+        raise DevkitFlowError(f"Status file not found: {path}")
+    current_text = path.read_text(encoding="utf-8")
+    atomic_write_text(path, render_design_task_table_text(current_text, table, source=path))
+
+
+def render_design_task_table_text(
+    current_text: str, table: dict[str, Any], *, source: Path | str = "<memory>"
+) -> str:
+    """016 T-09：内存表 → STATUS.md 全文（``save_design_task_table`` 的纯函数内核，不落盘）。
+
+    与原实现同口径：表区间以 ``current_text`` 重新定位（而非 table 解析时的行号），其余行逐字节保留。
+    """
     headers: list[str] = table["headers"]
     rows: list[dict[str, str]] = table["rows"]
     rendered = [
@@ -412,10 +466,10 @@ def save_design_task_table(path: Path, table: dict[str, Any]) -> None:
     for row in rows:
         rendered.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
 
-    current = parse_design_task_table(path)
+    current = parse_design_task_table_text(current_text, source=source)
     lines: list[str] = current["lines"]
     updated = lines[: current["header_index"]] + rendered + lines[current["row_end"] :]
-    atomic_write_text(path, "\n".join(updated) + "\n")
+    return "\n".join(updated) + "\n"
 
 
 def design_task_row(task_id: str, description: str) -> dict[str, str]:
@@ -519,6 +573,16 @@ def ensure_design_tasks(
     scale: str,
     pipeline: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    # 016 T-10（D-40）：设计任务表补行/重排是整表读-改-写，持 STATUS 锁（外层已持锁时可重入）。
+    with flow_status_write_lock(path):
+        return _ensure_design_tasks_locked(path, scale, pipeline)
+
+
+def _ensure_design_tasks_locked(
+    path: Path,
+    scale: str,
+    pipeline: list[dict[str, str]] | None,
+) -> dict[str, Any]:
     lines = path.read_text(encoding="utf-8").splitlines()
     has_design_table = any(
         split_markdown_row(line)[:3] == ["任务ID", "类型", "描述"] for line in lines
@@ -565,6 +629,139 @@ def ensure_design_tasks(
     return table
 
 
+TASK_ONES_MERGE_COLUMNS = ("ONES任务ID", "ONES同步")
+
+
+def merge_task_ones_columns(path: Path, rows: list[dict[str, str]], *, design: bool) -> None:
+    """016 T-10（D-40）：ONES 回写只合并「ONES任务ID / ONES同步」两列，绝不整表覆盖。
+
+    ONES 同步在网络调用前后多次落本地检查点（先写 creating 再建单，防重复创建）；若用调用方早先 parse 的
+    内存整表直接保存，会把这期间其他写入（flow task set、批量、单步）改过的状态/时间戳回滚掉。这里在
+    STATUS.md（``design=True``）或 task.md 的写锁内重读最新表，只把 ``rows`` 中按任务ID 命中的两列抄过去
+    再落盘（表头列集合由 parse 按 2.45.0 口径补齐，渲染形状与原整表保存一致）；没有任何变化时不写盘。
+
+    D-51④（Codex P1-4）：调用方行里的 ONES任务ID 为空、而最新表里已有 ID 时，说明调用方持有的是建单前的
+    旧快照（另一进程已建单并落 ID）——该行两列都不合并，绝不用旧空 ID 覆盖已生成的 ID。
+    """
+    with flow_status_write_lock(path):
+        fresh = parse_design_task_table(path) if design else parse_task_table(path)
+        by_id = {row.get("任务ID", ""): row for row in fresh["rows"]}
+        changed = False
+        for source in rows:
+            target = by_id.get(source.get("任务ID", ""))
+            if target is None:
+                continue
+            if target.get("ONES任务ID", "").strip() and not source.get("ONES任务ID", "").strip():
+                continue
+            for column in TASK_ONES_MERGE_COLUMNS:
+                if column not in source:
+                    continue
+                if target.get(column, "") != source[column]:
+                    target[column] = source[column]
+                    changed = True
+        if not changed:
+            return
+        if design:
+            save_design_task_table(path, fresh)
+        else:
+            save_task_table(path, fresh)
+
+
+# D-51④：ONES 建单认领结果。
+ONES_CREATE_CLAIMED = "claimed"  # 已在锁内写下 creating，调用方可以建单
+ONES_CREATE_EXISTS = "exists"  # 最新文件里已有 ONES ID（另一进程已建单），调用方沿用该 ID，不得再建
+ONES_CREATE_IN_PROGRESS = "creating"  # 最新文件里已是 creating（另一进程正在建单或曾中断），调用方不得建单
+
+
+ONES_CREATE_LOCK_UNAVAILABLE = "ONES_CREATE_LOCK_UNAVAILABLE"
+
+
+@contextmanager
+def _ones_creation_claim_lock(path: Path, subject: str) -> Iterator[None]:
+    """D-57③ / D-61①：建单认领只认 spec 目录 fd 锁（``required=True``）；取不到时明确报错、不远端建单。
+
+    单步本地写入的降级（后备链 / 无锁，R-24）不授权远端建单：无法证明互斥时「重读 → 检查 → 写 creating」不原子，
+    两个并发同步都可能认领成功而重复建单。报错不含本机路径（N3-3：该文案会进入 ONES同步 单元格与 outbox）。"""
+    try:
+        with flow_status_write_lock(path, required=True):
+            yield
+    except FlowStatusLockUnavailable:
+        raise DevkitFlowError(
+            f"{subject} ONES creation was not attempted: cannot acquire an exclusive lock on the spec directory of "
+            f"{path.name}. Automatic create requires a lock to prevent duplicates; retry where the spec directory "
+            "supports file locking, or create it manually and link it with `devkit-flow ones link`.",
+            error_code=ONES_CREATE_LOCK_UNAVAILABLE,
+        ) from None
+
+
+def _task_claim_state(path: Path, task_id: str, *, design: bool) -> tuple[dict[str, Any], dict[str, str]]:
+    fresh = parse_design_task_table(path) if design else parse_task_table(path)
+    target = next((candidate for candidate in fresh["rows"] if candidate.get("任务ID", "") == task_id), None)
+    if target is None:
+        raise DevkitFlowError(f"Task not found: {task_id}")
+    return fresh, target
+
+
+def claim_task_ones_creation(path: Path, row: dict[str, str], *, design: bool) -> tuple[str, str]:
+    """016 T-10（D-51④ / Codex P1-4）：在 STATUS.md / task.md 写锁内「重读 → 检查 → 认领（写 creating）」。
+
+    建单决策不能用锁外旧快照：两个同步先后读到同一空 ID 再各自建单会产生两个远端 ID。这里把检查与 creating
+    检查点放进同一临界区；``row`` 按最新文件就地刷新两列（exists 时带回已生成的 ID）。返回 (结果, 已有 ID)。
+    D-61④：取锁前先无锁读一次——已有 ID / 已是 creating 时无需认领，直接返回（调用方按 2.45.0 原文拒绝或沿用 ID），
+    锁不可用也不改变这两条兼容路径；只有真正需要认领时才要求共同锁。
+    """
+    task_id = row.get("任务ID", "")
+    for locked in (False, True):
+        with (_ones_creation_claim_lock(path, f"Task {task_id}") if locked else nullcontext()):
+            fresh, target = _task_claim_state(path, task_id, design=design)
+            existing_id = target.get("ONES任务ID", "").strip()
+            sync_state = target.get("ONES同步", "")
+            if existing_id:
+                row["ONES任务ID"] = existing_id
+                row["ONES同步"] = sync_state
+                return ONES_CREATE_EXISTS, existing_id
+            if sync_state.strip().startswith("creating"):
+                row["ONES同步"] = sync_state
+                return ONES_CREATE_IN_PROGRESS, ""
+            if not locked:
+                continue
+            target["ONES同步"] = "creating"
+            row["ONES同步"] = "creating"
+            if design:
+                save_design_task_table(path, fresh)
+            else:
+                save_task_table(path, fresh)
+            return ONES_CREATE_CLAIMED, ""
+    raise AssertionError("unreachable")
+
+
+def _status_summary_field(text: str, field_name: str) -> str:
+    prefix = f"**{field_name}**:"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return ""
+
+
+def claim_requirement_ones_creation(status_path: Path) -> tuple[str, str]:
+    """需求级同款认领（D-51④）：STATUS.md 写锁内重读 ONES需求ID / ONES同步，未建且未在建时写 creating。
+    D-61④：同样先无锁读一次，已有 ID / 已是 creating 时不取锁直接返回。"""
+    for locked in (False, True):
+        with (_ones_creation_claim_lock(status_path, "Requirement") if locked else nullcontext()):
+            text = status_path.read_text(encoding="utf-8")
+            existing_id = _status_summary_field(text, "ONES需求ID")
+            if existing_id:
+                return ONES_CREATE_EXISTS, existing_id
+            if _status_summary_field(text, "ONES同步").startswith("creating"):
+                return ONES_CREATE_IN_PROGRESS, ""
+            if not locked:
+                continue
+            atomic_write_text(status_path, render_status_field_text(text, "ONES同步", "creating"))
+            return ONES_CREATE_CLAIMED, ""
+    raise AssertionError("unreachable")
+
+
 def find_task_row(table: dict[str, Any], task_id: str) -> dict[str, str]:
     for row in table["rows"]:
         if row.get("任务ID") == task_id:
@@ -574,7 +771,12 @@ def find_task_row(table: dict[str, Any], task_id: str) -> dict[str, str]:
 
 def parse_pipeline_table(path: Path) -> dict[str, Any]:
     """Parse the ## 流水线 table keeping raw line indices for in-place rewrites."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    return parse_pipeline_table_text(path.read_text(encoding="utf-8"))
+
+
+def parse_pipeline_table_text(text: str) -> dict[str, Any]:
+    """016 T-09：从内存文本解析 ## 流水线 主表（``parse_pipeline_table`` 的纯函数内核）。"""
+    lines = text.splitlines()
     in_pipeline = False
     rows: list[dict[str, Any]] = []
     for index, line in enumerate(lines):
@@ -595,10 +797,15 @@ def parse_pipeline_table(path: Path) -> dict[str, Any]:
 
 def save_pipeline_rows(path: Path, table: dict[str, Any], dirty_rows: list[dict[str, Any]]) -> None:
     """Rewrite only the given rows; every other line stays byte-identical."""
+    atomic_write_text(path, render_pipeline_rows_text(table, dirty_rows))
+
+
+def render_pipeline_rows_text(table: dict[str, Any], dirty_rows: list[dict[str, Any]]) -> str:
+    """016 T-09：内存表 → STATUS.md 全文（``save_pipeline_rows`` 的纯函数内核，不落盘）。"""
     lines = list(table["lines"])
     for row in dirty_rows:
         lines[row["line_index"]] = "| " + " | ".join(row["cells"]) + " |"
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 # --- ## 流水线历史 归档区（append-only，9 列；免迁移双格式：无归档区=cycle 1）---

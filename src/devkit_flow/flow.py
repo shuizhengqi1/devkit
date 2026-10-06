@@ -9,13 +9,16 @@ import re
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 from devkit_flow.embedded import embedded_templates
-from devkit_flow.config import load_devkit_config, ones_config_summary, ones_follow_up_sync
-from devkit_flow.constants import CLARIFICATION_SCHEMA_VERSION, CLOSED_STATES, COMPLETION_GATE_STEPS, CONFIG_GATED_STEPS, DASHBOARD_STEP_TIMINGS_FILE, DESIGN_REVIEW_ARTIFACT_KEYWORDS, DESIGN_REVIEW_STEPS, DONE_STATES, E2E_GATE_STEP, FEATURE_NAME_PATTERN, FLOW_GUARDED_STATES, FLOW_MODES, FLOW_STEP_STATES, FLOW_TASK_STATES, ONES_OUTBOX_SCHEMA_VERSION, PIPELINE_MODE_ROWS, PIPELINE_SCALE_STEPS, PROGRESS_SUMMARY_LABELS, REQUIRED_DESIGN_REVIEW_STEPS, ROLLBACK_DESIGN_TASK_HINTS, SKIPPED_STATES, SMALL_TASK_HEADERS, STEP_ARTIFACT_MAP, STEP_TIMINGS_SCHEMA_VERSION, TASK_ARCH_REVIEW_STEPS, TELEMETRY_OUTBOX_RELATIVE_PATH, WAIVABLE_STEPS, WAIVED_STATES, accept_risk_gates_for_mode
+from devkit_flow.config import load_config_file, load_devkit_config, ones_config_summary, ones_follow_up_sync
+from devkit_flow.constants import CLARIFICATION_SCHEMA_VERSION, CLOSED_STATES, CONFIG_PATH, COMPLETION_GATE_STEPS, CONFIG_GATED_STEPS, DASHBOARD_STEP_TIMINGS_FILE, DESIGN_REVIEW_ARTIFACT_KEYWORDS, DESIGN_REVIEW_STEPS, DONE_STATES, E2E_GATE_STEP, FEATURE_NAME_PATTERN, FLOW_GUARDED_STATES, FLOW_MODES, FLOW_STEP_STATES, FLOW_TASK_STATES, ONES_OUTBOX_SCHEMA_VERSION, PIPELINE_MODE_ROWS, PIPELINE_SCALE_STEPS, PROGRESS_SUMMARY_LABELS, REQUIRED_DESIGN_REVIEW_STEPS, ROLLBACK_DESIGN_TASK_HINTS, SKIPPED_STATES, SMALL_TASK_HEADERS, STEP_ARTIFACT_MAP, STEP_TIMINGS_SCHEMA_VERSION, TASK_ARCH_REVIEW_STEPS, TELEMETRY_OUTBOX_RELATIVE_PATH, WAIVABLE_STEPS, WAIVED_STATES, accept_risk_gates_for_mode
 from devkit_flow.errors import DevkitFlowError
+from devkit_flow.project_detect import ProfileCache, ProjectDetector
+from devkit_flow.rule_sources import RULES_BINDING_STALE, BindingReceipt, RuleSourceCatalog, RuleSourceSelector
 from devkit_flow.parse_util import append_pipeline_history_rows, ensure_design_tasks, feature_name_from_dir, find_features, find_task_row, markdown_cell, next_feature_id, parse_design_task_table, parse_pipeline_history, parse_pipeline_table, parse_status_file, parse_task_table, render_status_template, report_clarification_stats, report_human_intervention_count, save_design_task_table, save_pipeline_rows, save_task_table, select_feature, set_status_field, small_task_row, status_path_for_feature, task_path_for_feature, write_new_small_task_file
 from devkit_flow.pipeline_gates import (
     DependencyRewrite,
@@ -28,7 +31,7 @@ from devkit_flow.pipeline_gates import (
     scale_narrowed_step_ids,
 )
 from devkit_flow.step_alias import ALIAS_ROWS, StepAliasRow, StepResolution, attach_step_resolution, feature_pipeline_mode, resolve_step
-from devkit_flow.textio import atomic_write_text, attach_dashboard_warning, compact_error, emit, emit_update_notice, maybe_check_latest_update
+from devkit_flow.textio import atomic_write_text, attach_dashboard_warning, compact_error, emit, emit_update_notice, flow_status_write_lock, maybe_check_latest_update
 
 
 def command_feature_next_id(args: argparse.Namespace) -> int:
@@ -197,7 +200,12 @@ def progress_summary_values(table: dict[str, Any]) -> dict[str, str]:
 
 
 def rewrite_progress_summary(path: Path, values: dict[str, str]) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
+    atomic_write_text(path, render_progress_summary_text(path.read_text(encoding="utf-8"), values))
+
+
+def render_progress_summary_text(text: str, values: dict[str, str]) -> str:
+    """016 T-09（§4.7.2.3）：内存版「进度概要」受管区改写，返回全文（不落盘）。"""
+    lines = text.splitlines()
     start = next(
         (index for index, line in enumerate(lines) if line.strip() == "## 进度概要"),
         None,
@@ -207,8 +215,7 @@ def rewrite_progress_summary(path: Path, values: dict[str, str]) -> None:
             lines.pop()
         lines.extend(["", "## 进度概要", ""])
         lines.extend(f"- {label}: {values[label]}" for label in PROGRESS_SUMMARY_LABELS)
-        atomic_write_text(path, "\n".join(lines) + "\n")
-        return
+        return "\n".join(lines) + "\n"
     end = next(
         (
             index
@@ -226,7 +233,7 @@ def rewrite_progress_summary(path: Path, values: dict[str, str]) -> None:
         else:
             lines.insert(end, replacement)
             end += 1
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 def read_progress_summary(path: Path) -> dict[str, str]:
@@ -850,6 +857,105 @@ def _emit_feature_completed(
     )
 
 
+def _apply_step_timing_transition(
+    cycles: list[Any],
+    *,
+    feature_dir: Path,
+    step_id: str,
+    state: str,
+    prior_state: str,
+    now: str,
+    accept_risk: bool = False,
+    session_ref: dict[str, Any] | None = None,
+) -> bool:
+    """record_step_timing 的周期迁移内核（就地修改 ``cycles``，返回是否有变更；只读 STATUS.md 归档区，不写任何文件）。
+
+    016 T-10（D-57④）：抽出为独立函数，供批量操作在预写账本时对 cycles 快照副本**预演**同一迁移，
+    得到本批次会闭合的精确周期序号（``predict_step_cycle_closures``），恢复补发只发这些周期。
+    """
+    mutated = False
+
+    def has_open_cycle() -> bool:
+        return bool(cycles) and isinstance(cycles[-1], dict) and cycles[-1].get("ended_at") is None
+
+    def new_cycle(started: str, ended: str | None, ended_by: str | None = None) -> dict[str, Any]:
+        cycle: dict[str, Any] = {
+            "started_at": started,
+            "ended_at": ended,
+            "cycle_index": len(cycles) + 1,
+        }
+        if ended_by is not None:
+            cycle["ended_by"] = ended_by
+        if session_ref is not None:
+            cycle["session"] = session_ref
+        return cycle
+
+    def close_open_cycle(ended: str, ended_by: str) -> None:
+        cycles[-1]["ended_at"] = ended
+        cycles[-1]["ended_by"] = ended_by
+        cycles[-1].setdefault("cycle_index", len(cycles))
+
+    def archived_ended_at() -> str | None:
+        """已归档未闭合识别（014 §4.3.2 崩溃自愈）：归档区存在本步骤且 cycle_index
+        等于开周期序号（缺字段历史 cycle 按序号回填，开周期序号 = 其 1 基位置）的
+        归档行时返回其归档时间（缺省回落 now）；否则 None。"""
+        if not has_open_cycle():
+            return None
+        try:
+            history = parse_pipeline_history(feature_dir / "STATUS.md")
+        except Exception:
+            return None
+        open_index = str(len(cycles))
+        for row in history.get("rows", []):
+            cells = row.get("cells") if isinstance(row, dict) else None
+            if (
+                isinstance(cells, list)
+                and len(cells) >= 8
+                and str(cells[0]).strip() == step_id
+                and str(cells[6]).strip() == open_index
+            ):
+                return str(cells[7]).strip() or now
+        return None
+
+    # 先行自愈（任何埋点先执行）：存在开周期且置位前状态非活跃 = 悬空开周期。
+    # 已归档未闭合（rollback 跨文件写崩溃中间态）→ 按归档时间补齐闭合
+    # （ended_by=rollback）；无归档信息的悬空开周期 → 沿用废弃兜底（删除，不计耗时）。
+    if has_open_cycle() and prior_state not in STEP_TIMING_ACTIVE_STATES:
+        archived_at = archived_ended_at()
+        if archived_at is not None:
+            close_open_cycle(archived_at, "rollback")
+        else:
+            cycles.pop()
+        mutated = True
+
+    if state in STEP_TIMING_ACTIVE_STATES:
+        # 活跃态：无开周期（含悬空已愈合）→ 开新周期；活跃态之间迁移不重复开。
+        if not has_open_cycle():
+            cycles.append(new_cycle(now, None))
+            mutated = True
+    elif state == "pending":
+        # pending = 回到未开始：rollback 归档路径闭合当前开周期（ended_by=rollback，
+        # 修既有废弃删除缺陷，回退周期耗时可计量）；无归档信息时沿用废弃兜底；
+        # 无开周期时 no-op；已闭合历史保留。
+        if has_open_cycle():
+            archived_at = archived_ended_at()
+            if archived_at is not None:
+                close_open_cycle(archived_at, "rollback")
+            else:
+                cycles.pop()
+            mutated = True
+    elif state in DONE_STATES or state in SKIPPED_STATES:
+        if has_open_cycle():
+            close_open_cycle(now, "done")
+            mutated = True
+        elif not accept_risk:
+            # 漏斗终态且无开周期 → 瞬时周期；accept-risk 变体无开周期不记（接口文档 §2.6）。
+            cycles.append(new_cycle(now, now, ended_by="done"))
+            mutated = True
+    # 其余状态（如 waived）不产生埋点事件；调用方本就不应传入。
+    return mutated
+
+
 def record_step_timing(
     feature_dir: Path,
     step_id: str,
@@ -902,86 +1008,16 @@ def record_step_timing(
         cycles = entry.get("cycles") if isinstance(entry, dict) else None
         if not isinstance(cycles, list):
             cycles = []
-        mutated = False
-
-        def has_open_cycle() -> bool:
-            return bool(cycles) and isinstance(cycles[-1], dict) and cycles[-1].get("ended_at") is None
-
-        def new_cycle(started: str, ended: str | None, ended_by: str | None = None) -> dict[str, Any]:
-            cycle: dict[str, Any] = {
-                "started_at": started,
-                "ended_at": ended,
-                "cycle_index": len(cycles) + 1,
-            }
-            if ended_by is not None:
-                cycle["ended_by"] = ended_by
-            if session_ref is not None:
-                cycle["session"] = session_ref
-            return cycle
-
-        def close_open_cycle(ended: str, ended_by: str) -> None:
-            cycles[-1]["ended_at"] = ended
-            cycles[-1]["ended_by"] = ended_by
-            cycles[-1].setdefault("cycle_index", len(cycles))
-
-        def archived_ended_at() -> str | None:
-            """已归档未闭合识别（014 §4.3.2 崩溃自愈）：归档区存在本步骤且 cycle_index
-            等于开周期序号（缺字段历史 cycle 按序号回填，开周期序号 = 其 1 基位置）的
-            归档行时返回其归档时间（缺省回落 now）；否则 None。"""
-            if not has_open_cycle():
-                return None
-            try:
-                history = parse_pipeline_history(feature_dir / "STATUS.md")
-            except Exception:
-                return None
-            open_index = str(len(cycles))
-            for row in history.get("rows", []):
-                cells = row.get("cells") if isinstance(row, dict) else None
-                if (
-                    isinstance(cells, list)
-                    and len(cells) >= 8
-                    and str(cells[0]).strip() == step_id
-                    and str(cells[6]).strip() == open_index
-                ):
-                    return str(cells[7]).strip() or now
-            return None
-
-        # 先行自愈（任何埋点先执行）：存在开周期且置位前状态非活跃 = 悬空开周期。
-        # 已归档未闭合（rollback 跨文件写崩溃中间态）→ 按归档时间补齐闭合
-        # （ended_by=rollback）；无归档信息的悬空开周期 → 沿用废弃兜底（删除，不计耗时）。
-        if has_open_cycle() and prior_state not in STEP_TIMING_ACTIVE_STATES:
-            archived_at = archived_ended_at()
-            if archived_at is not None:
-                close_open_cycle(archived_at, "rollback")
-            else:
-                cycles.pop()
-            mutated = True
-
-        if state in STEP_TIMING_ACTIVE_STATES:
-            # 活跃态：无开周期（含悬空已愈合）→ 开新周期；活跃态之间迁移不重复开。
-            if not has_open_cycle():
-                cycles.append(new_cycle(now, None))
-                mutated = True
-        elif state == "pending":
-            # pending = 回到未开始：rollback 归档路径闭合当前开周期（ended_by=rollback，
-            # 修既有废弃删除缺陷，回退周期耗时可计量）；无归档信息时沿用废弃兜底；
-            # 无开周期时 no-op；已闭合历史保留。
-            if has_open_cycle():
-                archived_at = archived_ended_at()
-                if archived_at is not None:
-                    close_open_cycle(archived_at, "rollback")
-                else:
-                    cycles.pop()
-                mutated = True
-        elif state in DONE_STATES or state in SKIPPED_STATES:
-            if has_open_cycle():
-                close_open_cycle(now, "done")
-                mutated = True
-            elif not accept_risk:
-                # 漏斗终态且无开周期 → 瞬时周期；accept-risk 变体无开周期不记（接口文档 §2.6）。
-                cycles.append(new_cycle(now, now, ended_by="done"))
-                mutated = True
-        # 其余状态（如 waived）不产生埋点事件；调用方本就不应传入。
+        mutated = _apply_step_timing_transition(
+            cycles,
+            feature_dir=feature_dir,
+            step_id=step_id,
+            state=state,
+            prior_state=prior_state,
+            now=now,
+            accept_risk=accept_risk,
+            session_ref=session_ref,
+        )
 
         if mutated:
             # 加性回填：本次已有写入时顺带为本步骤缺 cycle_index 的历史 cycle 按序号补齐
@@ -1093,6 +1129,36 @@ def emit_step_cycle(
         return None
 
 
+def predict_step_cycle_closures(
+    feature_dir: Path,
+    step_id: str,
+    before: list[dict[str, Any]] | None,
+    state: str,
+    prior_state: str,
+) -> list[int] | None:
+    """016 T-10（D-57④）：对 cycles 快照副本预演本次置位的周期迁移，返回会新闭合的周期序号（0 基，口径与
+    ``_step_cycle_events_since`` 的差分一致）。``before`` 为 None（基线读取失败）时返回 None（调用方不发 step_cycle）。"""
+    if before is None:
+        return None
+    simulated = copy.deepcopy(before)
+    _apply_step_timing_transition(
+        simulated,
+        feature_dir=feature_dir,
+        step_id=step_id,
+        state=state,
+        prior_state=prior_state,
+        now=flow_now_iso(),
+    )
+    closed: list[int] = []
+    for index, cycle in enumerate(simulated):
+        if not isinstance(cycle, dict) or cycle.get("ended_at") is None:
+            continue
+        if index < len(before) and before[index].get("ended_at") is not None:
+            continue
+        closed.append(index)
+    return closed
+
+
 def _step_cycle_events_since(
     workspace: Path,
     feature: dict[str, Any] | None,
@@ -1101,6 +1167,7 @@ def _step_cycle_events_since(
     *,
     command: str,
     ones_sync_active: bool = True,
+    cycle_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """R19 差分发射：record_step_timing 前快照（before）对照当前 cycles[]，本次新闭合的
     cycle（ended_at 由 None 变有值，或新增的已闭合瞬时周期）各发一条 step_cycle。
@@ -1121,6 +1188,8 @@ def _step_cycle_events_since(
                 continue
             if index < len(before) and before[index].get("ended_at") is not None:
                 continue  # 此前已闭合的周期已发过事件
+            if cycle_indices is not None and index not in cycle_indices:
+                continue  # 016 T-10（D-57④）：只发原批次精确闭合的周期，不把后续周期计入旧批次
             event = emit_step_cycle(
                 workspace,
                 feature,
@@ -1137,9 +1206,56 @@ def _step_cycle_events_since(
         return []
 
 
-def apply_flow_set(
+class FlowGuardError(DevkitFlowError):
+    """016 T-10：单步/批量共用守卫的拒绝异常，``guard`` 标注拒绝类别（``invalid`` / ``dependency`` / ``gate``）。
+
+    文案与 2.45.0 逐字一致、不带 ``error_code``（单步 JSON 输出形状不变）；批量入口据 ``guard`` 映射
+    FLOW_BATCH_INVALID_MEMBER / FLOW_BATCH_DEPENDENCY_UNMET / FLOW_BATCH_GATE_REQUIRED。
+    """
+
+    def __init__(self, message: str, *, guard: str) -> None:
+        super().__init__(message)
+        self.guard = guard
+
+
+def validate_flow_step_state(state: str) -> None:
+    """流水线步骤目标状态枚举守卫（waived 只走 accept-risk）。"""
+    if state in WAIVED_STATES:
+        raise FlowGuardError(
+            "waived 只能由 flow accept-risk 记录人工风险接受，不能通过 flow set 直接置位。",
+            guard="invalid",
+        )
+    if state not in FLOW_STEP_STATES:
+        raise FlowGuardError(
+            f"非法状态: {state}（可选: {', '.join(sorted(FLOW_STEP_STATES))}）",
+            guard="invalid",
+        )
+
+
+def step_clarify_guard_applies(collecting_batch: dict[str, Any] | None, state: str) -> bool:
+    """014 R7（D-18）澄清 collecting 守卫谓词：批次 collecting 且目标为回写类状态时命中。
+
+    纯函数，单步 ``flow set`` 与批量共用；命中后的输出/override 处理由调用方决定。
+    """
+    return collecting_batch is not None and state in FLOW_GUARDED_STATES
+
+
+@dataclass
+class StepMemberPlan:
+    """``plan_step_member`` 的求值结果：守卫已全部通过、尚未写入表。"""
+
+    step_id: str
+    row: dict[str, Any]
+    prior_state: str
+    state: str
+    note: str
+    forced: bool
+
+
+def plan_step_member(
     workspace: Path,
     feature: dict[str, Any],
+    table: dict[str, Any],
     step_id: str,
     state: str,
     *,
@@ -1147,36 +1263,25 @@ def apply_flow_set(
     confirmed: bool = False,
     force: bool = False,
     reason: str | None = None,
-    trigger: str = "set",
-    dashboard_refresh: Callable[[Path, dict[str, Any]], str | None] | None = None,
     gate_guard: Callable[[Path], Any] | None = None,
-    no_ones_sync: bool = False,
-) -> dict[str, Any]:
-    """flow set/confirm/mode 共用漏斗：落盘状态并产出 `_events`。
+) -> StepMemberPlan:
+    """016 T-09（§4.7.2.3）：流水线步骤置位的纯守卫与单元格计算（不写盘、不改 ``table``）。
 
-    注：``dashboard_refresh`` 自 012 D-6 起不再在本函数内触发（dashboard 重渲染由各 command_* 在
-    side_effects 之后挂钩），仅为签名兼容保留（D-13 ②，deprecated），调用方无需再传。
+    守卫顺序与 2.45.0 ``apply_flow_set`` 逐条一致：状态枚举 → 行存在 → 依赖/``--force`` → ``-H`` 需
+    ``--confirmed`` → S5-E2E skipped 理由 / done 证据门 → 任务级架构审查无 S5.7 不得 skipped。
+    批量入口对内存表副本逐成员调用，与单步共用同一份守卫代码。
     """
-    if state in WAIVED_STATES:
-        raise DevkitFlowError(
-            "waived 只能由 flow accept-risk 记录人工风险接受，不能通过 flow set 直接置位。"
-        )
-    if state not in FLOW_STEP_STATES:
-        raise DevkitFlowError(
-            f"非法状态: {state}（可选: {', '.join(sorted(FLOW_STEP_STATES))}）"
-        )
-    status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
+    validate_flow_step_state(state)
     row = next((candidate for candidate in table["rows"] if candidate["cells"][0] == step_id), None)
     if row is None:
-        raise DevkitFlowError(f"流水线中不存在步骤: {step_id}")
+        raise FlowGuardError(f"流水线中不存在步骤: {step_id}", guard="invalid")
 
     forced = False
     if state in FLOW_GUARDED_STATES:
         satisfied, detail = dependency_report(table["rows"], row["cells"][3])
         if not satisfied:
             if force and not (reason or "").strip():
-                raise DevkitFlowError("--force 需要同时提供 --reason 说明强制原因。")
+                raise FlowGuardError("--force 需要同时提供 --reason 说明强制原因。", guard="invalid")
             if not force:
                 unmet = [
                     f"{step['id']}({step['state']})"
@@ -1184,27 +1289,31 @@ def apply_flow_set(
                     for step in alternative["steps"]
                     if not step["satisfied"]
                 ]
-                raise DevkitFlowError(
+                raise FlowGuardError(
                     f"步骤 {step_id} 的依赖未满足: {', '.join(unmet)}；"
-                    "如确需跳过请使用 --force --reason。"
+                    "如确需跳过请使用 --force --reason。",
+                    guard="dependency",
                 )
             forced = True
     if step_id.endswith("-H") and state in DONE_STATES and not confirmed:
-        raise DevkitFlowError(
-            f"该步骤需要人工确认：{step_id} 是人工 Gate，置 done 必须携带 --confirmed。"
+        raise FlowGuardError(
+            f"该步骤需要人工确认：{step_id} 是人工 Gate，置 done 必须携带 --confirmed。",
+            guard="gate",
         )
 
     # S5-E2E 置位守卫（设计 §4.5.1，接口文档 §4.5）：在既有依赖/人工 Gate 校验之后追加。
     # gate 证据校验独立于 --force（force 仅豁免步骤依赖检查），防止击穿「宁红勿假绿」。
     if step_id == E2E_GATE_STEP and state in SKIPPED_STATES and not (note or "").strip():
-        raise DevkitFlowError(
-            f"{E2E_GATE_STEP} 置 skipped 必须通过 --note 携带书面理由（无跨进程面说明）。"
+        raise FlowGuardError(
+            f"{E2E_GATE_STEP} 置 skipped 必须通过 --note 携带书面理由（无跨进程面说明）。",
+            guard="gate",
         )
     if step_id == E2E_GATE_STEP and state in DONE_STATES:
         if gate_guard is None:
-            raise DevkitFlowError(
+            raise FlowGuardError(
                 f"{E2E_GATE_STEP} 置 done 需要 e2e 门证据校验，但 gate_guard 未注入"
-                "（应由 cli 组装注入 evaluate_e2e_gate）。"
+                "（应由 cli 组装注入 evaluate_e2e_gate）。",
+                guard="gate",
             )
         verdict = gate_guard(workspace)
         outcome = getattr(verdict, "verdict", "")
@@ -1218,13 +1327,15 @@ def apply_flow_set(
                     if isinstance(item, dict)
                 )
                 report_url = getattr(verdict, "report_url", "") or "-"
-                raise DevkitFlowError(
+                raise FlowGuardError(
                     f"{E2E_GATE_STEP} 门判定 fail（{gate_reason}），拒绝置 done。"
-                    f"失败明细：{detail or '（无）'}；报告：{report_url}。"
+                    f"失败明细：{detail or '（无）'}；报告：{report_url}。",
+                    guard="gate",
                 )
-            raise DevkitFlowError(
+            raise FlowGuardError(
                 f"{E2E_GATE_STEP} 门证据不可用（{gate_reason}），拒绝置 done；"
-                "须 verdict=pass 且 failed=0，或以 skipped + 书面理由关闭。"
+                "须 verdict=pass 且 failed=0，或以 skipped + 书面理由关闭。",
+                guard="gate",
             )
 
     # 016 D-39（S5.7 P0-1）：任务级架构审查（传统 S5.3 / TDD S5.5）置 skipped 的唯一合法语义是
@@ -1233,29 +1344,58 @@ def apply_flow_set(
     # mode 走 feature_resolved_mode（与 complete/verify/migrate-steps 同一口径，D-40）：未确认时两步都拦（fail-closed）。
     if step_id in task_arch_review_steps_for_mode(feature_resolved_mode(table, feature)) and state in SKIPPED_STATES:
         if not any(candidate["cells"][0] == "S5.7" for candidate in table["rows"]):
-            raise DevkitFlowError(_task_arch_deferred_without_s57_message([step_id]))
+            raise FlowGuardError(_task_arch_deferred_without_s57_message([step_id]), guard="gate")
 
     cells = row["cells"]
-    prior_state = cells[4]  # R7 埋点：置位前状态从行内取得（设计 §4.7.1）
-    cells[4] = state
     new_note = note if note is not None else (cells[5] if len(cells) > 5 else "")
     if forced:
         append = f"强制置位：{reason.strip()}"
         new_note = f"{new_note}；{append}" if new_note else append
+    return StepMemberPlan(
+        step_id=step_id,
+        row=row,
+        prior_state=cells[4],
+        state=state,
+        note=new_note,
+        forced=forced,
+    )
+
+
+def apply_step_member_plan(plan: StepMemberPlan, table: dict[str, Any] | None = None) -> dict[str, Any]:
+    """把 ``plan_step_member`` 结果写入内存表行（不落盘），返回被改写的行。
+
+    用法约束（T-09 审查 P2-B）：必须在**同一张表**上 plan → apply 交替执行——先对一个成员 plan 并立即 apply，
+    再 plan 下一个成员；不得先批量 plan 再统一 apply，也不得把 plan 套到重新 parse 出的另一张表上。
+    传入 ``table`` 时校验 ``plan.row`` 确属该表（身份比较），违反即抛错而非静默丢更新。
+    """
+    if table is not None and not any(candidate is plan.row for candidate in table["rows"]):
+        raise DevkitFlowError(f"内部错误：{plan.step_id} 的置位计划不属于当前流水线表（须同表 plan→apply 交替）。")
+    cells = plan.row["cells"]
+    cells[4] = plan.state
     while len(cells) < 6:
         cells.append("")
-    cells[5] = new_note
-    save_pipeline_rows(status_path, table, [row])
-    set_status_field(status_path, "最后更新", flow_today())
-    updated_table = parse_pipeline_table(status_path)
-    rewrite_progress_summary(status_path, progress_summary_values(updated_table))
-    # R7 埋点：STATUS.md 写入成功后调用（flow set/confirm/mode 三入口共用漏斗，fail-safe）
-    feature_dir = workspace / feature["feature_dir"]
-    cycles_before = _step_cycle_entries(feature_dir, step_id)
-    timing_warning = record_step_timing(
-        feature_dir, step_id, state, prior_state, flow_now_iso(),
-        session_ref=flow_session_ref(workspace),
-    )
+    cells[5] = plan.note
+    return plan.row
+
+
+def flow_step_member_events(
+    workspace: Path,
+    feature: dict[str, Any],
+    step_id: str,
+    prior_state: str,
+    state: str,
+    *,
+    trigger: str,
+    confirmed: bool,
+    no_ones_sync: bool,
+    cycles_before: list[dict[str, Any]] | None,
+    cycle_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """016 T-10：步骤置位后的事件序列（单步漏斗与批量入口共用，保证逐位一致）。
+
+    顺序：step_transition → 本次新闭合周期的 step_cycle → done 时 quality_collect 意图 → waiting-confirmation
+    时 intervention(gate)。``cycles_before`` 为 ``record_step_timing`` 之前的 cycles[] 快照。
+    """
     # 点位 #1/#12：flow set/confirm/mode 共用漏斗，尾部产出 step_transition 事件（_events 契约）。
     # D-23（014 T16）：v1 feature 上下文事件补 trace 注入（_flow_feature_trace 现成通道，fail-safe）。
     events: list[dict[str, Any]] = [
@@ -1280,6 +1420,7 @@ def apply_flow_set(
         _step_cycle_events_since(
             workspace, feature, step_id, cycles_before,
             command=f"flow {trigger}", ones_sync_active=not no_ones_sync,
+            cycle_indices=cycle_indices,
         )
     )
     if state == "done":
@@ -1303,6 +1444,73 @@ def apply_flow_set(
                 command=f"flow {trigger}", ones_sync_active=not no_ones_sync,
             )
         )
+    return events
+
+
+def apply_flow_set(
+    workspace: Path,
+    feature: dict[str, Any],
+    step_id: str,
+    state: str,
+    *,
+    note: str | None = None,
+    confirmed: bool = False,
+    force: bool = False,
+    reason: str | None = None,
+    trigger: str = "set",
+    dashboard_refresh: Callable[[Path, dict[str, Any]], str | None] | None = None,
+    gate_guard: Callable[[Path], Any] | None = None,
+    no_ones_sync: bool = False,
+) -> dict[str, Any]:
+    """flow set/confirm/mode 共用漏斗：落盘状态并产出 `_events`。
+
+    注：``dashboard_refresh`` 自 012 D-6 起不再在本函数内触发（dashboard 重渲染由各 command_* 在
+    side_effects 之后挂钩），仅为签名兼容保留（D-13 ②，deprecated），调用方无需再传。
+    """
+    validate_flow_step_state(state)
+    status_path = status_path_for_feature(workspace, feature)
+    feature_dir = workspace / feature["feature_dir"]
+    # 016 T-09（BC-05）：读-改-写 STATUS.md 与 .step-timings.json 全程持锁，与批量入口互斥，
+    # 并发单步/批量不丢更新；写入次序（行 → 最后更新 → 进度概要）与 2.45.0 一致。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        plan = plan_step_member(
+            workspace,
+            feature,
+            table,
+            step_id,
+            state,
+            note=note,
+            confirmed=confirmed,
+            force=force,
+            reason=reason,
+            gate_guard=gate_guard,
+        )
+        forced = plan.forced
+        prior_state = plan.prior_state  # R7 埋点：置位前状态从行内取得（设计 §4.7.1）
+        row = apply_step_member_plan(plan, table)
+        cells = row["cells"]
+        save_pipeline_rows(status_path, table, [row])
+        set_status_field(status_path, "最后更新", flow_today())
+        updated_table = parse_pipeline_table(status_path)
+        rewrite_progress_summary(status_path, progress_summary_values(updated_table))
+        # R7 埋点：STATUS.md 写入成功后调用（flow set/confirm/mode 三入口共用漏斗，fail-safe）
+        cycles_before = _step_cycle_entries(feature_dir, step_id)
+        timing_warning = record_step_timing(
+            feature_dir, step_id, state, prior_state, flow_now_iso(),
+            session_ref=flow_session_ref(workspace),
+        )
+    events = flow_step_member_events(
+        workspace,
+        feature,
+        step_id,
+        prior_state,
+        state,
+        trigger=trigger,
+        confirmed=confirmed,
+        no_ones_sync=no_ones_sync,
+        cycles_before=cycles_before,
+    )
 
     data: dict[str, Any] = {
         "status": "ok",
@@ -1540,17 +1748,23 @@ def _collecting_clarification_batch(workspace: Path, feature: dict[str, Any]) ->
     return payload
 
 
+def clarify_collecting_guard_message(batch: dict[str, Any], *, action: str) -> str:
+    """014 R7 collecting 守卫拒绝文案（单步 ``_emit_clarify_collecting_guard`` 与批量入口共用，016 T-10）。"""
+    batch_id = str(batch.get("batchId") or "")
+    return (
+        f"澄清批次 {batch_id} 处于 collecting，{action} 属回写类动作，默认拒绝。"
+        "请先 `flow clarify apply` / `flow clarify close` 密封批次后再执行；"
+        "确需绕过请显式加 `--override-clarify-guard`（override 将记录为外部干预事件）。"
+    )
+
+
 def _emit_clarify_collecting_guard(args: argparse.Namespace, batch: dict[str, Any], *, action: str) -> int:
     """014 R7（接口文档 §3.4/§7）：collecting 期间回写类动作默认拒绝（CLARIFY_COLLECTING_GUARD）。"""
     batch_id = str(batch.get("batchId") or "")
     data = {
         "status": "error",
         "error_code": "CLARIFY_COLLECTING_GUARD",
-        "message": (
-            f"澄清批次 {batch_id} 处于 collecting，{action} 属回写类动作，默认拒绝。"
-            "请先 `flow clarify apply` / `flow clarify close` 密封批次后再执行；"
-            "确需绕过请显式加 `--override-clarify-guard`（override 将记录为外部干预事件）。"
-        ),
+        "message": clarify_collecting_guard_message(batch, action=action),
         "batch_id": batch_id,
         "recovery_actions": [
             "flow clarify apply",
@@ -1570,7 +1784,7 @@ def command_flow_set(args: argparse.Namespace, *, dashboard_refresh: Callable[[P
     # = in-progress/done/skipped，推进/收尾结论）默认拒绝；pending/blocked/
     # waiting-confirmation 属纯簿记放行。
     collecting_batch = _collecting_clarification_batch(workspace, feature)
-    guard_applies = collecting_batch is not None and args.status in FLOW_GUARDED_STATES
+    guard_applies = step_clarify_guard_applies(collecting_batch, args.status)
     if guard_applies and not getattr(args, "override_clarify_guard", False):
         return _emit_clarify_collecting_guard(args, collecting_batch, action=f"flow set --status {args.status}")
     status_path = status_path_for_feature(workspace, feature)
@@ -1626,31 +1840,33 @@ def _accept_task_arch_risk(
     if not task_id:
         raise DevkitFlowError("任务级架构风险接受必须携带 --task-id。")
     status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
-    rows_by_id = {row["cells"][0]: row for row in table["rows"]}
-    gate = rows_by_id.get(args.gate)
-    if gate is None:
-        raise DevkitFlowError(f"流水线中不存在人工 Gate: {args.gate}")
-    state = gate["cells"][4]
-    if state in DONE_STATES:
-        raise DevkitFlowError(f"{args.gate} 已完成，无需重复接受风险。")
-    if state in WAIVED_STATES:
-        raise DevkitFlowError(f"{args.gate} 已记录风险接受。")
-    if state not in {"blocked", "in-progress", "waiting-confirmation"}:
-        raise DevkitFlowError(
-            f"{args.gate} 当前状态为 {state}；只能对已开始且未通过的任务级架构审查接受风险。"
-        )
-    cells = gate["cells"]
-    cells[4] = "waived"
-    while len(cells) < 6:
-        cells.append("")
-    extra = f"人工风险接受：task={task_id}；{reason}"
-    cells[5] = f"{cells[5]}；{extra}" if cells[5] else extra
-    save_pipeline_rows(status_path, table, [gate])
-    set_status_field(status_path, "最后更新", flow_today())
-    updated_table = parse_pipeline_table(status_path)
-    progress = progress_summary_values(updated_table)
-    rewrite_progress_summary(status_path, progress)
+    # 016 T-10（D-40）：读-检查-写全程持 STATUS 锁，与单步/批量写互斥。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        rows_by_id = {row["cells"][0]: row for row in table["rows"]}
+        gate = rows_by_id.get(args.gate)
+        if gate is None:
+            raise DevkitFlowError(f"流水线中不存在人工 Gate: {args.gate}")
+        state = gate["cells"][4]
+        if state in DONE_STATES:
+            raise DevkitFlowError(f"{args.gate} 已完成，无需重复接受风险。")
+        if state in WAIVED_STATES:
+            raise DevkitFlowError(f"{args.gate} 已记录风险接受。")
+        if state not in {"blocked", "in-progress", "waiting-confirmation"}:
+            raise DevkitFlowError(
+                f"{args.gate} 当前状态为 {state}；只能对已开始且未通过的任务级架构审查接受风险。"
+            )
+        cells = gate["cells"]
+        cells[4] = "waived"
+        while len(cells) < 6:
+            cells.append("")
+        extra = f"人工风险接受：task={task_id}；{reason}"
+        cells[5] = f"{cells[5]}；{extra}" if cells[5] else extra
+        save_pipeline_rows(status_path, table, [gate])
+        set_status_field(status_path, "最后更新", flow_today())
+        updated_table = parse_pipeline_table(status_path)
+        progress = progress_summary_values(updated_table)
+        rewrite_progress_summary(status_path, progress)
     # 点位 #3（D-14）：任务级架构审查 waiver——发 gate_event(arch-waiver, waived) + step_transition。
     waiver_trace = _flow_feature_trace(workspace, feature)  # D-23：v1 事件 trace 注入
     events: list[dict[str, Any]] = [
@@ -1747,44 +1963,65 @@ def command_flow_accept_risk(args: argparse.Namespace, *, dashboard_refresh: Cal
             side_effects=side_effects,
         )
     feature_dir = workspace / feature["feature_dir"]
-    table = parse_pipeline_table(status_path)
-    rows_by_id = {row["cells"][0]: row for row in table["rows"]}
-    gate = rows_by_id.get(args.gate)
-    if gate is None:
-        raise DevkitFlowError(f"流水线中不存在人工 Gate: {args.gate}")
-    if gate["cells"][4] in DONE_STATES:
-        raise DevkitFlowError(f"{args.gate} 已完成，无需重复接受风险。")
+    # 016 T-10（D-40）：读-检查-写（含 step timing）全程持 STATUS 锁。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        rows_by_id = {row["cells"][0]: row for row in table["rows"]}
+        gate = rows_by_id.get(args.gate)
+        if gate is None:
+            raise DevkitFlowError(f"流水线中不存在人工 Gate: {args.gate}")
+        if gate["cells"][4] in DONE_STATES:
+            raise DevkitFlowError(f"{args.gate} 已完成，无需重复接受风险。")
 
-    missing_reviews = [step_id for step_id in REQUIRED_DESIGN_REVIEW_STEPS if step_id not in rows_by_id]
-    if missing_reviews:
-        raise DevkitFlowError(
-            f"流水线缺少必要设计审查步骤: {', '.join(missing_reviews)}；不能用风险接受替代缺失的流程定义。"
-        )
-    open_reviews = [
-        rows_by_id[step_id]
-        for step_id in DESIGN_REVIEW_STEPS
-        if step_id in rows_by_id and rows_by_id[step_id]["cells"][4] not in CLOSED_STATES
-    ]
-    if not open_reviews:
-        raise DevkitFlowError("没有未关闭的设计审查风险；请使用 flow confirm 完成人工确认。")
-
-    artifact_review_ids = {
-        *REQUIRED_DESIGN_REVIEW_STEPS,
-        *(review["cells"][0] for review in open_reviews),
-    }
-    for review_id in DESIGN_REVIEW_STEPS:
-        if review_id not in artifact_review_ids:
-            continue
-        if not review_artifacts(feature_dir, review_id):
-            keyword = DESIGN_REVIEW_ARTIFACT_KEYWORDS[review_id]
+        missing_reviews = [step_id for step_id in REQUIRED_DESIGN_REVIEW_STEPS if step_id not in rows_by_id]
+        if missing_reviews:
             raise DevkitFlowError(
-                f"{review_id} 对应的{keyword}正文不存在；风险接受不能替代设计产物。"
+                f"流水线缺少必要设计审查步骤: {', '.join(missing_reviews)}；不能用风险接受替代缺失的流程定义。"
             )
+        open_reviews = [
+            rows_by_id[step_id]
+            for step_id in DESIGN_REVIEW_STEPS
+            if step_id in rows_by_id and rows_by_id[step_id]["cells"][4] not in CLOSED_STATES
+        ]
+        if not open_reviews:
+            raise DevkitFlowError("没有未关闭的设计审查风险；请使用 flow confirm 完成人工确认。")
 
-    for review in open_reviews:
-        review_id = review["cells"][0]
-        satisfied, detail = dependency_report(table["rows"], review["cells"][3])
-        if not satisfied:
+        artifact_review_ids = {
+            *REQUIRED_DESIGN_REVIEW_STEPS,
+            *(review["cells"][0] for review in open_reviews),
+        }
+        for review_id in DESIGN_REVIEW_STEPS:
+            if review_id not in artifact_review_ids:
+                continue
+            if not review_artifacts(feature_dir, review_id):
+                keyword = DESIGN_REVIEW_ARTIFACT_KEYWORDS[review_id]
+                raise DevkitFlowError(
+                    f"{review_id} 对应的{keyword}正文不存在；风险接受不能替代设计产物。"
+                )
+
+        for review in open_reviews:
+            review_id = review["cells"][0]
+            satisfied, detail = dependency_report(table["rows"], review["cells"][3])
+            if not satisfied:
+                unmet = [
+                    f"{step['id']}({step['state']})"
+                    for alternative in detail
+                    for step in alternative["steps"]
+                    if not step["satisfied"]
+                ]
+                raise DevkitFlowError(
+                    f"{review_id} 的设计产物依赖未满足: {', '.join(unmet)}；"
+                    "风险接受只能处理审查遗留项，不能跳过设计正文产出。"
+                )
+
+        prospective_rows = copy.deepcopy(table["rows"])
+        prospective_by_id = {row["cells"][0]: row for row in prospective_rows}
+        for review in open_reviews:
+            prospective_by_id[review["cells"][0]]["cells"][4] = "waived"
+        gate_dependencies_satisfied, detail = dependency_report(
+            prospective_rows, gate["cells"][3]
+        )
+        if not gate_dependencies_satisfied:
             unmet = [
                 f"{step['id']}({step['state']})"
                 for alternative in detail
@@ -1792,64 +2029,45 @@ def command_flow_accept_risk(args: argparse.Namespace, *, dashboard_refresh: Cal
                 if not step["satisfied"]
             ]
             raise DevkitFlowError(
-                f"{review_id} 的设计产物依赖未满足: {', '.join(unmet)}；"
-                "风险接受只能处理审查遗留项，不能跳过设计正文产出。"
+                f"{args.gate} 仍有非设计审查依赖未满足: {', '.join(unmet)}；无法接受风险。"
             )
 
-    prospective_rows = copy.deepcopy(table["rows"])
-    prospective_by_id = {row["cells"][0]: row for row in prospective_rows}
-    for review in open_reviews:
-        prospective_by_id[review["cells"][0]]["cells"][4] = "waived"
-    gate_dependencies_satisfied, detail = dependency_report(
-        prospective_rows, gate["cells"][3]
-    )
-    if not gate_dependencies_satisfied:
-        unmet = [
-            f"{step['id']}({step['state']})"
-            for alternative in detail
-            for step in alternative["steps"]
-            if not step["satisfied"]
-        ]
-        raise DevkitFlowError(
-            f"{args.gate} 仍有非设计审查依赖未满足: {', '.join(unmet)}；无法接受风险。"
+        dirty_rows: list[dict[str, Any]] = []
+        review_prior_states = {
+            review["cells"][0]: review["cells"][4] for review in open_reviews
+        }
+        for review in open_reviews:
+            cells = review["cells"]
+            cells[4] = "waived"
+            while len(cells) < 6:
+                cells.append("")
+            cells[5] = (
+                f"{cells[5]}；人工风险接受：{reason}" if cells[5] else f"人工风险接受：{reason}"
+            )
+            dirty_rows.append(review)
+        gate_cells = gate["cells"]
+        gate_prior_state = gate_cells[4]  # R7 埋点：gate 置位前状态（accept-risk 变体）
+        gate_cells[4] = "done"
+        while len(gate_cells) < 6:
+            gate_cells.append("")
+        gate_cells[5] = (
+            f"{gate_cells[5]}；人工确认并接受审查遗留风险：{reason}"
+            if gate_cells[5]
+            else f"人工确认并接受审查遗留风险：{reason}"
         )
+        dirty_rows.append(gate)
 
-    dirty_rows: list[dict[str, Any]] = []
-    review_prior_states = {
-        review["cells"][0]: review["cells"][4] for review in open_reviews
-    }
-    for review in open_reviews:
-        cells = review["cells"]
-        cells[4] = "waived"
-        while len(cells) < 6:
-            cells.append("")
-        cells[5] = (
-            f"{cells[5]}；人工风险接受：{reason}" if cells[5] else f"人工风险接受：{reason}"
+        save_pipeline_rows(status_path, table, dirty_rows)
+        set_status_field(status_path, "最后更新", flow_today())
+        updated_table = parse_pipeline_table(status_path)
+        progress = progress_summary_values(updated_table)
+        rewrite_progress_summary(status_path, progress)
+        # R7 埋点：gate 置 done 直写路径（绕过漏斗），accept-risk 变体——有开周期闭合、无开周期不记；
+        # 审查步骤置 waived 不产生埋点事件（遗留开周期按悬空由自愈规则兜底）。
+        timing_warning = record_step_timing(
+            feature_dir, args.gate, "done", gate_prior_state, flow_now_iso(), accept_risk=True,
+            session_ref=flow_session_ref(workspace),
         )
-        dirty_rows.append(review)
-    gate_cells = gate["cells"]
-    gate_prior_state = gate_cells[4]  # R7 埋点：gate 置位前状态（accept-risk 变体）
-    gate_cells[4] = "done"
-    while len(gate_cells) < 6:
-        gate_cells.append("")
-    gate_cells[5] = (
-        f"{gate_cells[5]}；人工确认并接受审查遗留风险：{reason}"
-        if gate_cells[5]
-        else f"人工确认并接受审查遗留风险：{reason}"
-    )
-    dirty_rows.append(gate)
-
-    save_pipeline_rows(status_path, table, dirty_rows)
-    set_status_field(status_path, "最后更新", flow_today())
-    updated_table = parse_pipeline_table(status_path)
-    progress = progress_summary_values(updated_table)
-    rewrite_progress_summary(status_path, progress)
-    # R7 埋点：gate 置 done 直写路径（绕过漏斗），accept-risk 变体——有开周期闭合、无开周期不记；
-    # 审查步骤置 waived 不产生埋点事件（遗留开周期按悬空由自愈规则兜底）。
-    timing_warning = record_step_timing(
-        feature_dir, args.gate, "done", gate_prior_state, flow_now_iso(), accept_risk=True,
-        session_ref=flow_session_ref(workspace),
-    )
     # 点位 #2：设计审查 waiver——每个被 waived 的审查步骤发 gate_event(review-waiver, waived)
     # 与 step_transition，gate 置 done 发 step_transition（事件原位产出，_events 契约）。
     excerpt = reason[:200] if reason else None
@@ -1949,52 +2167,54 @@ def command_flow_confirm(args: argparse.Namespace, *, dashboard_refresh: Callabl
     if feature is None:
         return 1
     status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
-    # 016 D-40：与 flow next 同一断点谓词（scale 收窄遗留 pending 行不是断点）。
-    _narrowed_ids, _narrowed_pending = scale_narrowed_pending_ids(
-        table, feature_scale(feature), feature_resolved_mode(table, feature)
-    )
-    breakpoint_row = pipeline_breakpoint(table, skip_pending_ids=_narrowed_ids)
-    if breakpoint_row is None:
-        if _narrowed_pending:
-            raise DevkitFlowError(
-                f"流水线已无可确认断点；遗留行 {', '.join(_narrowed_pending)} 已因规模收窄失效，"
-                "将在 flow complete 自动归档（scale-narrowed）。"
-            )
-        raise DevkitFlowError("流水线已无断点，所有步骤均为 done/skipped/waived。")
-    cells = breakpoint_row["cells"]
-    if cells[4] != "waiting-confirmation":
-        recovery_actions = _confirm_recovery_actions(feature, cells)
-        hints = [
-            "断点行已具备确认条件：flow set 置回 waiting-confirmation 后重试 confirm",
-            "断点行需要重做：flow rollback 回退到断点行",
-        ]
-        if any(action.startswith("flow accept-risk") for action in recovery_actions):
-            hints.append("审查遗留项可人工接受：flow accept-risk（需 --reason 与 --confirmed）")
-        data = {
-            "status": "error",
-            "error_code": "CONFIRM_BLOCKED",
-            "message": (
-                f"当前断点 {cells[0]} 的状态为 {cells[4]}，不是 waiting-confirmation，无法确认。"
-                f"恢复路径：{'；'.join(hints)}。"
-                f"可执行命令：{'；'.join(recovery_actions)}"
-            ),
-            "recovery_actions": recovery_actions,
-        }
-        emit(data, args.format)
-        return 1
-    step_id = cells[0]
-    data = apply_flow_set(
-        workspace,
-        feature,
-        step_id,
-        "done",
-        confirmed=True,
-        trigger="confirm",
-        dashboard_refresh=dashboard_refresh,
-        gate_guard=gate_guard,
-        no_ones_sync=_no_ones_sync(args),
-    )
+    # 016 T-10（D-40）：断点检查与置位同处一个临界区（检查移入锁内，消除 TOCTOU）。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        # 016 D-40：与 flow next 同一断点谓词（scale 收窄遗留 pending 行不是断点）。
+        _narrowed_ids, _narrowed_pending = scale_narrowed_pending_ids(
+            table, feature_scale(feature), feature_resolved_mode(table, feature)
+        )
+        breakpoint_row = pipeline_breakpoint(table, skip_pending_ids=_narrowed_ids)
+        if breakpoint_row is None:
+            if _narrowed_pending:
+                raise DevkitFlowError(
+                    f"流水线已无可确认断点；遗留行 {', '.join(_narrowed_pending)} 已因规模收窄失效，"
+                    "将在 flow complete 自动归档（scale-narrowed）。"
+                )
+            raise DevkitFlowError("流水线已无断点，所有步骤均为 done/skipped/waived。")
+        cells = breakpoint_row["cells"]
+        if cells[4] != "waiting-confirmation":
+            recovery_actions = _confirm_recovery_actions(feature, cells)
+            hints = [
+                "断点行已具备确认条件：flow set 置回 waiting-confirmation 后重试 confirm",
+                "断点行需要重做：flow rollback 回退到断点行",
+            ]
+            if any(action.startswith("flow accept-risk") for action in recovery_actions):
+                hints.append("审查遗留项可人工接受：flow accept-risk（需 --reason 与 --confirmed）")
+            data = {
+                "status": "error",
+                "error_code": "CONFIRM_BLOCKED",
+                "message": (
+                    f"当前断点 {cells[0]} 的状态为 {cells[4]}，不是 waiting-confirmation，无法确认。"
+                    f"恢复路径：{'；'.join(hints)}。"
+                    f"可执行命令：{'；'.join(recovery_actions)}"
+                ),
+                "recovery_actions": recovery_actions,
+            }
+            emit(data, args.format)
+            return 1
+        step_id = cells[0]
+        data = apply_flow_set(
+            workspace,
+            feature,
+            step_id,
+            "done",
+            confirmed=True,
+            trigger="confirm",
+            dashboard_refresh=dashboard_refresh,
+            gate_guard=gate_guard,
+            no_ones_sync=_no_ones_sync(args),
+        )
     data["message"] = f"{step_id} 人工确认完成，状态已置为 done。"
     # 点位 #1 confirm：人工 Gate（-H）放行发 gate_event，并作为 flush 点发 gate-flush 快照。
     if step_id.endswith("-H"):
@@ -2187,66 +2407,68 @@ def command_flow_rollback(args: argparse.Namespace, *, dashboard_refresh: Callab
         extra_rows=_custom_step_rows(status_path),
     )
     args.step = resolution.step_id
-    table = parse_pipeline_table(status_path)
-    start = next(
-        (
-            index
-            for index, row in enumerate(table["rows"])
-            if row["cells"][0] == args.step
-        ),
-        None,
-    )
-    if start is None:
-        raise DevkitFlowError(f"流水线中不存在步骤: {args.step}")
-
-    # 014 R14（D-A5 有意语义变更）：默认 --affected-only 取受影响闭包；
-    # --all-downstream 保留旧语义（目标步骤到表尾全部重置）。
-    if getattr(args, "all_downstream", False):
-        affected = table["rows"][start:]
-    else:
-        closure = set(compute_affected_closure(table, args.step, STEP_ARTIFACT_MAP))
-        affected = [row for row in table["rows"] if row["cells"][0] in closure]
-    affected_ids = [row["cells"][0] for row in affected]
-    unaffected = [
-        step_id
-        for step_id in _dependency_downstream(table, args.step)
-        if step_id not in affected_ids
-    ]
-    prior_states = {row["cells"][0]: row["cells"][4] for row in affected}
-
-    # cycle 化（014 D-5）：当前 cycle 行移入 append-only 归档区（保留置位前状态），
-    # 主表生成新一轮 pending 行；归档 cycle_index 逐步骤取各自开周期基位置（MAJOR-01，
-    # 机器事实源 = .step-timings.json cycles[]，两处同源同值），存量无归档区/无旁车视为
-    # cycle 1；JSON 输出的 cycle_index 以回滚起点步骤为锚（新 cycle 序号）。
-    feature_dir = workspace / feature["feature_dir"]
-    archived_cycle = _current_cycle_index(feature_dir, args.step)
-    archive_cycle_rows(status_path, table, affected, archived_cycle, (args.reason or "").strip())
-    set_status_field(status_path, "最后更新", flow_today())
-    rewrite_progress_summary(status_path, progress_summary_values(parse_pipeline_table(status_path)))
-
-    # 014 D-5 缺陷修复（原 flow.py:669-672 废弃删除）：归档完成后对每个回退步骤走
-    # record_step_timing pending 闭合路径（T5 移交：开周期按归档时间闭合 ended_by=rollback，
-    # 回退周期耗时可计量；无归档信息的悬空开周期沿用废弃兜底）。
-    now = flow_now_iso()
-    session_ref = flow_session_ref(workspace)
-    timing_warnings: list[str] = []
-    cycle_events: list[dict[str, Any]] = []
-    for step_id in affected_ids:
-        cycles_before = _step_cycle_entries(feature_dir, step_id)
-        timing_warning = record_step_timing(
-            feature_dir, step_id, "pending", prior_states.get(step_id) or "", now,
-            session_ref=session_ref,
+    # 016 T-10（D-40）：归档 + 字段 + 进度概要 + step timing 全程持 STATUS 锁。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        start = next(
+            (
+                index
+                for index, row in enumerate(table["rows"])
+                if row["cells"][0] == args.step
+            ),
+            None,
         )
-        if timing_warning:
-            timing_warnings.append(timing_warning)
-        # R19（T7 预留点接线）：每个受影响步骤本次新闭合的周期发 step_cycle
-        #（ended_by=rollback 取自 cycles[] 条目本身，与归档/闭合同源；逐步骤差分，
-        # 崩溃自愈补齐闭合同样覆盖；废弃兜底删除的悬空开周期不发事件）。
-        cycle_events.extend(
-            _step_cycle_events_since(
-                workspace, feature, step_id, cycles_before, command="flow rollback"
+        if start is None:
+            raise DevkitFlowError(f"流水线中不存在步骤: {args.step}")
+
+        # 014 R14（D-A5 有意语义变更）：默认 --affected-only 取受影响闭包；
+        # --all-downstream 保留旧语义（目标步骤到表尾全部重置）。
+        if getattr(args, "all_downstream", False):
+            affected = table["rows"][start:]
+        else:
+            closure = set(compute_affected_closure(table, args.step, STEP_ARTIFACT_MAP))
+            affected = [row for row in table["rows"] if row["cells"][0] in closure]
+        affected_ids = [row["cells"][0] for row in affected]
+        unaffected = [
+            step_id
+            for step_id in _dependency_downstream(table, args.step)
+            if step_id not in affected_ids
+        ]
+        prior_states = {row["cells"][0]: row["cells"][4] for row in affected}
+
+        # cycle 化（014 D-5）：当前 cycle 行移入 append-only 归档区（保留置位前状态），
+        # 主表生成新一轮 pending 行；归档 cycle_index 逐步骤取各自开周期基位置（MAJOR-01，
+        # 机器事实源 = .step-timings.json cycles[]，两处同源同值），存量无归档区/无旁车视为
+        # cycle 1；JSON 输出的 cycle_index 以回滚起点步骤为锚（新 cycle 序号）。
+        feature_dir = workspace / feature["feature_dir"]
+        archived_cycle = _current_cycle_index(feature_dir, args.step)
+        archive_cycle_rows(status_path, table, affected, archived_cycle, (args.reason or "").strip())
+        set_status_field(status_path, "最后更新", flow_today())
+        rewrite_progress_summary(status_path, progress_summary_values(parse_pipeline_table(status_path)))
+
+        # 014 D-5 缺陷修复（原 flow.py:669-672 废弃删除）：归档完成后对每个回退步骤走
+        # record_step_timing pending 闭合路径（T5 移交：开周期按归档时间闭合 ended_by=rollback，
+        # 回退周期耗时可计量；无归档信息的悬空开周期沿用废弃兜底）。
+        now = flow_now_iso()
+        session_ref = flow_session_ref(workspace)
+        timing_warnings: list[str] = []
+        cycle_events: list[dict[str, Any]] = []
+        for step_id in affected_ids:
+            cycles_before = _step_cycle_entries(feature_dir, step_id)
+            timing_warning = record_step_timing(
+                feature_dir, step_id, "pending", prior_states.get(step_id) or "", now,
+                session_ref=session_ref,
             )
-        )
+            if timing_warning:
+                timing_warnings.append(timing_warning)
+            # R19（T7 预留点接线）：每个受影响步骤本次新闭合的周期发 step_cycle
+            #（ended_by=rollback 取自 cycles[] 条目本身，与归档/闭合同源；逐步骤差分，
+            # 崩溃自愈补齐闭合同样覆盖；废弃兜底删除的悬空开周期不发事件）。
+            cycle_events.extend(
+                _step_cycle_events_since(
+                    workspace, feature, step_id, cycles_before, command="flow rollback"
+                )
+            )
 
     # 点位 #4：每个被回退步骤发一条 step_transition(trigger=rollback, to_status=pending)；
     # step_cycle 先于 step_transition（设计 §4.2.1 时序：闭合周期 → 发 step_cycle → 发 step_transition）。
@@ -2310,6 +2532,142 @@ def command_flow_rollback(args: argparse.Namespace, *, dashboard_refresh: Callab
     return 0
 
 
+def validate_flow_task_state(state: str) -> None:
+    """任务目标状态枚举守卫（设计/开发任务共用）。"""
+    if state not in FLOW_TASK_STATES:
+        raise FlowGuardError(f"非法任务状态: {state}（可选: {', '.join(FLOW_TASK_STATES)}）", guard="invalid")
+
+
+@dataclass
+class TaskMemberPlan:
+    """``plan_task_member`` 的求值结果：守卫已通过、尚未写入表。``cells`` 为该行置位后的完整单元格。"""
+
+    task_id: str
+    is_design: bool
+    row: dict[str, str]
+    note_column: str
+    add_note_column: bool
+    prior_state: str
+    state: str
+    cells: dict[str, str]
+    reopened: bool
+    baseline: dict[str, str] | None = None
+
+
+def task_note_column(table: dict[str, Any], *, is_design: bool) -> str:
+    if is_design:
+        return "备注"
+    if "产出/备注" in table["headers"]:
+        return "产出/备注"
+    return "备注"
+
+
+def plan_task_member(
+    table: dict[str, Any],
+    task_id: str,
+    state: str,
+    *,
+    is_design: bool,
+    note: str | None,
+    confirm_gates: bool,
+    now: str,
+) -> TaskMemberPlan:
+    """016 T-09（§4.7.2.3）：任务置位的纯守卫与单元格计算（不写盘、不改 ``table``）。
+
+    守卫与单元格语义与 2.45.0 ``command_flow_task_set`` 一致：状态枚举 → 任务存在 → ``已完成`` 需
+    ``--confirm-gates``；「执行中」首置记实际开始、自「已完成」重开记原完成并清空实际完成；
+    「已完成」每次都改写实际完成（重复完成不拒绝，R-24）；``note`` 追加到备注列。
+    """
+    validate_flow_task_state(state)
+    row = find_task_row(table, task_id)
+    note_column = task_note_column(table, is_design=is_design)
+    add_note_column = note_column not in table["headers"]
+
+    cells = dict(row)
+    if add_note_column:
+        cells.setdefault(note_column, "")
+    previous = cells.get("状态", "").strip()
+    reopened = False
+    if state == "执行中":
+        if not cells.get("实际开始", "").strip():
+            cells["实际开始"] = now
+        if previous == "已完成":
+            old_completed = cells.get("实际完成", "").strip()
+            if old_completed:
+                append_cell_note(cells, note_column, f"原完成：{old_completed}")
+            cells["实际完成"] = ""
+            reopened = True
+    elif state == "已完成":
+        if not confirm_gates:
+            raise FlowGuardError(
+                "置为已完成必须携带 --confirm-gates（声明 Gate 矩阵已关闭）。",
+                guard="gate",
+            )
+        cells["实际完成"] = now
+    cells["状态"] = state
+    if note:
+        append_cell_note(cells, note_column, note)
+    return TaskMemberPlan(
+        task_id=task_id,
+        is_design=is_design,
+        row=row,
+        note_column=note_column,
+        add_note_column=add_note_column,
+        prior_state=previous,
+        state=state,
+        cells=cells,
+        reopened=reopened,
+        baseline=dict(row),
+    )
+
+
+def apply_task_member_plan(table: dict[str, Any], plan: TaskMemberPlan) -> dict[str, str]:
+    """把 ``plan_task_member`` 结果写入内存表（必要时补备注列，不落盘），返回被改写的行。
+
+    用法约束（T-09 审查 P2-B）：同一张表上 plan → apply 交替执行。``plan.cells`` 是 plan 时整行的快照，
+    若同一行在 plan 之后已被改写（例如对同一任务先后 plan 两次再统一 apply），或 ``plan.row`` 不属于
+    传入的 ``table``（套到重新 parse 的表上），直接抛错，杜绝静默丢更新。
+    """
+    if not any(candidate is plan.row for candidate in table["rows"]):
+        raise DevkitFlowError(f"内部错误：{plan.task_id} 的置位计划不属于当前任务表（须同表 plan→apply 交替）。")
+    if plan.baseline is not None and plan.row != plan.baseline:
+        raise DevkitFlowError(f"内部错误：{plan.task_id} 在 plan 之后已被改写（须 plan→apply 交替，不得重复 plan 同一任务）。")
+    if plan.add_note_column and plan.note_column not in table["headers"]:
+        table["headers"].append(plan.note_column)
+        for candidate in table["rows"]:
+            candidate.setdefault(plan.note_column, "")
+    plan.row.update(plan.cells)
+    return plan.row
+
+
+def flow_task_member_event(
+    workspace: Path,
+    feature: dict[str, Any],
+    task_id: str,
+    previous: str,
+    state: str,
+    *,
+    is_design: bool,
+    no_ones_sync: bool,
+) -> dict[str, Any]:
+    """016 T-10：任务置位的 task_transition 事件（单步 ``flow task set`` 与批量入口共用，逐位一致）。"""
+    # 点位 #5：设计/开发任务状态迁移发 task_transition(trigger=set)。
+    return flow_emit_event(
+        workspace, feature, "task_transition",
+        {
+            "task_id": task_id,
+            "task_kind": "design" if is_design else "dev",
+            "from_status": previous or None,
+            "to_status": state,
+            "trigger": "set",
+            "ones_task_id": _payload_ones_task_id(workspace, feature, task_id),
+        },
+        command="flow task set",
+        ones_sync_active=not no_ones_sync,
+        trace=_flow_feature_trace(workspace, feature),  # D-23：v1 事件 trace 注入
+    )
+
+
 def command_flow_task_set(args: argparse.Namespace, *, dashboard_refresh: Callable[[Path, dict[str, Any]], str | None] | None = None, side_effects: WriteSideEffects | None = None) -> int:
     workspace = Path.cwd()
     feature = flow_select_feature(workspace, args)
@@ -2317,71 +2675,40 @@ def command_flow_task_set(args: argparse.Namespace, *, dashboard_refresh: Callab
         return 1
     task_id = args.task_id
     state = args.status
-    if state not in FLOW_TASK_STATES:
-        raise DevkitFlowError(f"非法任务状态: {state}（可选: {', '.join(FLOW_TASK_STATES)}）")
+    validate_flow_task_state(state)
 
     is_design = task_id.startswith("D-")
     if is_design:
         target_path = status_path_for_feature(workspace, feature)
-        table = parse_design_task_table(target_path)
         save_table = save_design_task_table
     else:
         target_path = task_path_for_feature(workspace, feature)
         if not target_path.exists():
             raise DevkitFlowError(f"Task file not found: {target_path}")
-        table = parse_task_table(target_path)
         save_table = save_task_table
-    row = find_task_row(table, task_id)
 
-    if is_design:
-        note_column = "备注"
-    elif "产出/备注" in table["headers"]:
-        note_column = "产出/备注"
-    else:
-        note_column = "备注"
-    if note_column not in table["headers"]:
-        table["headers"].append(note_column)
-        for candidate in table["rows"]:
-            candidate.setdefault(note_column, "")
+    # 016 T-09（BC-05）：读-改-写全程持锁（D-xx 锁 STATUS.md，与 flow set / 批量互斥；T-xx 锁 task.md）。
+    # 重复「已完成」行为保持 2.45.0 不变（重写实际完成并再发 task_transition；BC-16 只改 manager 文本）。
+    with flow_status_write_lock(target_path):
+        table = parse_design_task_table(target_path) if is_design else parse_task_table(target_path)
+        plan = plan_task_member(
+            table,
+            task_id,
+            state,
+            is_design=is_design,
+            note=args.note,
+            confirm_gates=bool(args.confirm_gates),
+            now=flow_now_iso(),
+        )
+        row = apply_task_member_plan(table, plan)
+        save_table(target_path, table)
+    previous = plan.prior_state
+    reopened = plan.reopened
 
-    now = flow_now_iso()
-    previous = row.get("状态", "").strip()
-    reopened = False
-    if state == "执行中":
-        if not row.get("实际开始", "").strip():
-            row["实际开始"] = now
-        if previous == "已完成":
-            old_completed = row.get("实际完成", "").strip()
-            if old_completed:
-                append_cell_note(row, note_column, f"原完成：{old_completed}")
-            row["实际完成"] = ""
-            reopened = True
-    elif state == "已完成":
-        if not args.confirm_gates:
-            raise DevkitFlowError(
-                "置为已完成必须携带 --confirm-gates（声明 Gate 矩阵已关闭）。"
-            )
-        row["实际完成"] = now
-    row["状态"] = state
-    if args.note:
-        append_cell_note(row, note_column, args.note)
-    save_table(target_path, table)
-
-    # 点位 #5：设计/开发任务状态迁移发 task_transition(trigger=set)。
     events: list[dict[str, Any]] = [
-        flow_emit_event(
-            workspace, feature, "task_transition",
-            {
-                "task_id": task_id,
-                "task_kind": "design" if is_design else "dev",
-                "from_status": previous or None,
-                "to_status": state,
-                "trigger": "set",
-                "ones_task_id": _payload_ones_task_id(workspace, feature, task_id),
-            },
-            command="flow task set",
-            ones_sync_active=not _no_ones_sync(args),
-            trace=_flow_feature_trace(workspace, feature),  # D-23：v1 事件 trace 注入
+        flow_task_member_event(
+            workspace, feature, task_id, previous, state,
+            is_design=is_design, no_ones_sync=_no_ones_sync(args),
         )
     ]
 
@@ -2427,37 +2754,39 @@ def command_flow_task_ensure_small(args: argparse.Namespace, *, dashboard_refres
         raise DevkitFlowError("--description 不能为空。")
 
     task_path = task_path_for_feature(workspace, feature)
-    created = False
-    if task_path.exists():
-        table = parse_task_table(task_path)
-        existing = next(
-            (row for row in table["rows"] if row.get("任务ID", "").strip() == "T-01"),
-            None,
-        )
-        if existing is None and table["rows"]:
-            ids = ", ".join(row.get("任务ID", "?") for row in table["rows"])
-            raise DevkitFlowError(
-                f"small feature 已有开发任务 {ids}，无法安全推断 T-01；请先核对现有 task.md。"
+    # 016 T-10（D-40）：task.md 读-改-写持 task.md 锁（与 flow task set T-xx 互斥）。
+    with flow_status_write_lock(task_path):
+        created = False
+        if task_path.exists():
+            table = parse_task_table(task_path)
+            existing = next(
+                (row for row in table["rows"] if row.get("任务ID", "").strip() == "T-01"),
+                None,
             )
-        if existing is None:
+            if existing is None and table["rows"]:
+                ids = ", ".join(row.get("任务ID", "?") for row in table["rows"])
+                raise DevkitFlowError(
+                    f"small feature 已有开发任务 {ids}，无法安全推断 T-01；请先核对现有 task.md。"
+                )
+            if existing is None:
+                existing = small_task_row(description, args.write_scope, args.acceptance)
+                for header in SMALL_TASK_HEADERS:
+                    if header not in table["headers"]:
+                        output_index = (
+                            table["headers"].index("产出/备注")
+                            if "产出/备注" in table["headers"]
+                            else len(table["headers"])
+                        )
+                        table["headers"].insert(output_index, header)
+                        for row in table["rows"]:
+                            row.setdefault(header, "")
+                table["rows"].append(existing)
+                save_task_table(task_path, table)
+                created = True
+        else:
             existing = small_task_row(description, args.write_scope, args.acceptance)
-            for header in SMALL_TASK_HEADERS:
-                if header not in table["headers"]:
-                    output_index = (
-                        table["headers"].index("产出/备注")
-                        if "产出/备注" in table["headers"]
-                        else len(table["headers"])
-                    )
-                    table["headers"].insert(output_index, header)
-                    for row in table["rows"]:
-                        row.setdefault(header, "")
-            table["rows"].append(existing)
-            save_task_table(task_path, table)
+            write_new_small_task_file(task_path, feature["feature"], existing)
             created = True
-    else:
-        existing = small_task_row(description, args.write_scope, args.acceptance)
-        write_new_small_task_file(task_path, feature["feature"], existing)
-        created = True
 
     # 点位 #6：实际创建 T-01 时才发 task_transition(trigger=ensure-small)，已存在则幂等跳过。
     events: list[dict[str, Any]] = []
@@ -2514,133 +2843,135 @@ def command_flow_complete(args: argparse.Namespace, *, dashboard_refresh: Callab
     if feature is None:
         return 1
     status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
-    rows = [row["cells"] for row in table["rows"]]
-    # 完成 Gate 集合：S5-R 永远必需；S5.7 按 scale（small 去 S5.7，016 D-30）；S5-E2E 按配置快照。
-    # 016 D-40：scale/mode 走唯一口径（非法 scale 结构化报错；mode 未确认按两种模式并集裁剪）。
-    _scale = feature_scale(feature)
-    _mode = feature_resolved_mode(table, feature)
-    expected_gates = set(expected_completion_gate_steps(pipeline_config_snapshot(workspace), _scale))
-    gate_cells = {
-        step_id: next((cells for cells in rows if cells[0] == step_id), None)
-        for step_id in COMPLETION_GATE_STEPS
-    }
-    s5r = gate_cells["S5-R"]
-    if s5r is None:
-        raise DevkitFlowError(
-            "流水线中不存在 S5-R（受影响模块全量回归），无法完成；"
-            f"{_MIGRATE_STEPS_HINT} 补行并执行不带测试选择器的模块全量测试。"
-        )
-    if s5r[4] not in DONE_STATES:
-        raise DevkitFlowError(f"S5-R 当前状态为 {s5r[4]}，模块全量回归未通过，无法完成。")
-    # 016 D-30/D-18：S5.7 只对含它的档（large/large-no-context）硬检查；small 完成门不含 S5.7，
-    # 其存量迁移遗留的 S5.7 行交下方 D-32 自动归档 + open_steps 处理，不在此拦截。
-    s57 = gate_cells["S5.7"]
-    if "S5.7" in expected_gates:
-        if s57 is None:
-            raise DevkitFlowError(
-                f"流水线中不存在 S5.7（Feature 级综合审查），无法完成；{_MIGRATE_STEPS_HINT} 补行。"
-            )
-        if s57[4] not in DONE_STATES:
-            raise DevkitFlowError(f"S5.7 当前状态为 {s57[4]}，综合审查未通过，无法完成。")
-    else:
-        # 016 D-39（S5.7 P0-1）：完成门不含 S5.7 的档（small）没有 dev-once 递延落点——任务级架构审查
-        # 若为 skipped 即零架构审查（违反 FEATURE N8）。置位时刻已由 apply_flow_set 拒绝，此处对存量兜底。
-        _deferred_arch = [
-            cells[0]
-            for cells in rows
-            if cells[0] in task_arch_review_steps_for_mode(_mode) and cells[4] in SKIPPED_STATES
-        ]
-        if _deferred_arch:
-            raise DevkitFlowError(_task_arch_deferred_without_s57_message(_deferred_arch, scale=_scale))
-    invalid_waived_steps = [
-        cells[0]
-        for cells in rows
-        if cells[4] in WAIVED_STATES and cells[0] not in WAIVABLE_STEPS
-    ]
-    if invalid_waived_steps:
-        raise DevkitFlowError(
-            "waived 仅允许用于 S2 设计审查步骤与任务级架构审查（S5.5/S5.3）；"
-            "以下步骤必须恢复为真实状态后才能完成: "
-            + ", ".join(invalid_waived_steps)
-            + "。"
-        )
-    # S5-E2E 准出（设计 §4.2.5）：行缺失+配置关闭合法；行缺失+配置开启才催 migrate-steps；
-    # 行存在时现行为不变（done，或 skipped 且备注列含非空书面理由，R6）。
-    s5e2e = gate_cells[E2E_GATE_STEP]
-    if s5e2e is None:
-        if E2E_GATE_STEP in expected_gates:
-            raise DevkitFlowError(
-                f"流水线中不存在 {E2E_GATE_STEP}（需求准出 e2e 门），无法完成；"
-                f"{_MIGRATE_STEPS_HINT} 补行。"
-            )
-    elif s5e2e[4] not in DONE_STATES:
-        s5e2e_note = s5e2e[5].strip() if len(s5e2e) > 5 else ""
-        if not (s5e2e[4] in SKIPPED_STATES and s5e2e_note):
-            raise DevkitFlowError(
-                f"{E2E_GATE_STEP} 当前状态为 {s5e2e[4]}，e2e 准出门未关闭，无法完成；"
-                "须 done（gate verdict=pass），或 skipped 且备注列含非空书面理由。"
-            )
-    # 016 D-32：存量 small feature 经 migrate-steps（只插不删）会留下 scale 收窄后已不属当前档的
-    # pending 遗留行（如 small 的 S5.7）。完成门已按 scale 排除它，但 open_steps 全表终结检查仍要求
-    # 它关闭——两层口径不一致会误报「存在未关闭步骤」。校验阶段把「pending ∧ scale 收窄多余 ∧ 非配置门」
-    # 的遗留行视为将归档；真正的归档写盘在**全部前置校验通过之后**、经 apply_flow_set 漏斗执行
-    # （016 D-41：失败命令零写盘；落盘/最后更新/进度概要/step timing/step_transition 事件一并产出）。
-    # 仅 pending 生效；done/in-progress/blocked 保留真实轨迹。判定边界经 scale_narrowed_step_ids 双保险排除配置门行。
-    _narrowed_ids, _narrowed_pending = scale_narrowed_pending_ids(table, _scale, _mode)
-    open_steps = [
-        f"{cells[0]}({cells[4]})"
-        for cells in rows
-        if cells[4] not in CLOSED_STATES
-        and not (cells[0] in _narrowed_ids and cells[4] == "pending")
-    ]
-    if open_steps:
-        raise DevkitFlowError(f"存在未关闭步骤: {', '.join(open_steps)}。")
-    if _scale == "small":
-        task_path = task_path_for_feature(workspace, feature)
-        if not task_path.exists() or not any(
-            row.get("任务ID", "").strip() == "T-01"
-            for row in parse_task_table(task_path)["rows"]
-        ):
-            raise DevkitFlowError(
-                "Small Feature 缺少开发任务，无法完成；先执行 flow task ensure-small 创建 T-01。"
-            )
-    # ---- 全部前置校验通过：以下才开始写盘 ----
-    events: list[dict[str, Any]] = []
-    archived_steps: list[dict[str, str]] = []
-    for _step_id in _narrowed_pending:
-        _row = next(candidate for candidate in table["rows"] if candidate["cells"][0] == _step_id)
-        _reason = f"scale-narrowed: 遗留行按 {_scale} 档自动归档"
-        _prior_note = _row["cells"][5] if len(_row["cells"]) > 5 else ""
-        _satisfied, _ = dependency_report(table["rows"], _row["cells"][3])
-        # 遗留行的依赖可能指向已被裁剪的行（如 canonical S5.7 → S5-E2E）：此时以 force+reason 走漏斗，
-        # 备注由漏斗写「强制置位：{reason}」；依赖满足时直接把 reason 追加到原备注。
-        # ONES follow-up 由本命令末尾统一发一次需求同步，此处不重复入队。
-        _result = apply_flow_set(
-            workspace,
-            feature,
-            _step_id,
-            "skipped",
-            note=(f"{_prior_note}；{_reason}" if _prior_note.strip() else _reason) if _satisfied else None,
-            force=not _satisfied,
-            reason=None if _satisfied else _reason,
-            trigger="complete",
-            no_ones_sync=True,
-        )
-        events.extend(_result.get("_events") or [])
-        archived_steps.append(
-            {"step": _step_id, "from_status": "pending", "to_status": "skipped", "reason": _reason}
-        )
-    if _narrowed_pending:
+    # 016 T-10（D-40）：前置校验与全部写盘（含经漏斗的归档、设计任务补行、状态字段）同处一个临界区；漏斗内锁可重入。
+    with flow_status_write_lock(status_path):
         table = parse_pipeline_table(status_path)
         rows = [row["cells"] for row in table["rows"]]
-    if _scale == "small":
-        ensure_design_tasks(
-            status_path,
-            "small",
-            [{"id": cells[0], "state": cells[4]} for cells in rows],
-        )
-    set_status_field(status_path, "状态", "已完成")
+        # 完成 Gate 集合：S5-R 永远必需；S5.7 按 scale（small 去 S5.7，016 D-30）；S5-E2E 按配置快照。
+        # 016 D-40：scale/mode 走唯一口径（非法 scale 结构化报错；mode 未确认按两种模式并集裁剪）。
+        _scale = feature_scale(feature)
+        _mode = feature_resolved_mode(table, feature)
+        expected_gates = set(expected_completion_gate_steps(pipeline_config_snapshot(workspace), _scale))
+        gate_cells = {
+            step_id: next((cells for cells in rows if cells[0] == step_id), None)
+            for step_id in COMPLETION_GATE_STEPS
+        }
+        s5r = gate_cells["S5-R"]
+        if s5r is None:
+            raise DevkitFlowError(
+                "流水线中不存在 S5-R（受影响模块全量回归），无法完成；"
+                f"{_MIGRATE_STEPS_HINT} 补行并执行不带测试选择器的模块全量测试。"
+            )
+        if s5r[4] not in DONE_STATES:
+            raise DevkitFlowError(f"S5-R 当前状态为 {s5r[4]}，模块全量回归未通过，无法完成。")
+        # 016 D-30/D-18：S5.7 只对含它的档（large/large-no-context）硬检查；small 完成门不含 S5.7，
+        # 其存量迁移遗留的 S5.7 行交下方 D-32 自动归档 + open_steps 处理，不在此拦截。
+        s57 = gate_cells["S5.7"]
+        if "S5.7" in expected_gates:
+            if s57 is None:
+                raise DevkitFlowError(
+                    f"流水线中不存在 S5.7（Feature 级综合审查），无法完成；{_MIGRATE_STEPS_HINT} 补行。"
+                )
+            if s57[4] not in DONE_STATES:
+                raise DevkitFlowError(f"S5.7 当前状态为 {s57[4]}，综合审查未通过，无法完成。")
+        else:
+            # 016 D-39（S5.7 P0-1）：完成门不含 S5.7 的档（small）没有 dev-once 递延落点——任务级架构审查
+            # 若为 skipped 即零架构审查（违反 FEATURE N8）。置位时刻已由 apply_flow_set 拒绝，此处对存量兜底。
+            _deferred_arch = [
+                cells[0]
+                for cells in rows
+                if cells[0] in task_arch_review_steps_for_mode(_mode) and cells[4] in SKIPPED_STATES
+            ]
+            if _deferred_arch:
+                raise DevkitFlowError(_task_arch_deferred_without_s57_message(_deferred_arch, scale=_scale))
+        invalid_waived_steps = [
+            cells[0]
+            for cells in rows
+            if cells[4] in WAIVED_STATES and cells[0] not in WAIVABLE_STEPS
+        ]
+        if invalid_waived_steps:
+            raise DevkitFlowError(
+                "waived 仅允许用于 S2 设计审查步骤与任务级架构审查（S5.5/S5.3）；"
+                "以下步骤必须恢复为真实状态后才能完成: "
+                + ", ".join(invalid_waived_steps)
+                + "。"
+            )
+        # S5-E2E 准出（设计 §4.2.5）：行缺失+配置关闭合法；行缺失+配置开启才催 migrate-steps；
+        # 行存在时现行为不变（done，或 skipped 且备注列含非空书面理由，R6）。
+        s5e2e = gate_cells[E2E_GATE_STEP]
+        if s5e2e is None:
+            if E2E_GATE_STEP in expected_gates:
+                raise DevkitFlowError(
+                    f"流水线中不存在 {E2E_GATE_STEP}（需求准出 e2e 门），无法完成；"
+                    f"{_MIGRATE_STEPS_HINT} 补行。"
+                )
+        elif s5e2e[4] not in DONE_STATES:
+            s5e2e_note = s5e2e[5].strip() if len(s5e2e) > 5 else ""
+            if not (s5e2e[4] in SKIPPED_STATES and s5e2e_note):
+                raise DevkitFlowError(
+                    f"{E2E_GATE_STEP} 当前状态为 {s5e2e[4]}，e2e 准出门未关闭，无法完成；"
+                    "须 done（gate verdict=pass），或 skipped 且备注列含非空书面理由。"
+                )
+        # 016 D-32：存量 small feature 经 migrate-steps（只插不删）会留下 scale 收窄后已不属当前档的
+        # pending 遗留行（如 small 的 S5.7）。完成门已按 scale 排除它，但 open_steps 全表终结检查仍要求
+        # 它关闭——两层口径不一致会误报「存在未关闭步骤」。校验阶段把「pending ∧ scale 收窄多余 ∧ 非配置门」
+        # 的遗留行视为将归档；真正的归档写盘在**全部前置校验通过之后**、经 apply_flow_set 漏斗执行
+        # （016 D-41：失败命令零写盘；落盘/最后更新/进度概要/step timing/step_transition 事件一并产出）。
+        # 仅 pending 生效；done/in-progress/blocked 保留真实轨迹。判定边界经 scale_narrowed_step_ids 双保险排除配置门行。
+        _narrowed_ids, _narrowed_pending = scale_narrowed_pending_ids(table, _scale, _mode)
+        open_steps = [
+            f"{cells[0]}({cells[4]})"
+            for cells in rows
+            if cells[4] not in CLOSED_STATES
+            and not (cells[0] in _narrowed_ids and cells[4] == "pending")
+        ]
+        if open_steps:
+            raise DevkitFlowError(f"存在未关闭步骤: {', '.join(open_steps)}。")
+        if _scale == "small":
+            task_path = task_path_for_feature(workspace, feature)
+            if not task_path.exists() or not any(
+                row.get("任务ID", "").strip() == "T-01"
+                for row in parse_task_table(task_path)["rows"]
+            ):
+                raise DevkitFlowError(
+                    "Small Feature 缺少开发任务，无法完成；先执行 flow task ensure-small 创建 T-01。"
+                )
+        # ---- 全部前置校验通过：以下才开始写盘 ----
+        events: list[dict[str, Any]] = []
+        archived_steps: list[dict[str, str]] = []
+        for _step_id in _narrowed_pending:
+            _row = next(candidate for candidate in table["rows"] if candidate["cells"][0] == _step_id)
+            _reason = f"scale-narrowed: 遗留行按 {_scale} 档自动归档"
+            _prior_note = _row["cells"][5] if len(_row["cells"]) > 5 else ""
+            _satisfied, _ = dependency_report(table["rows"], _row["cells"][3])
+            # 遗留行的依赖可能指向已被裁剪的行（如 canonical S5.7 → S5-E2E）：此时以 force+reason 走漏斗，
+            # 备注由漏斗写「强制置位：{reason}」；依赖满足时直接把 reason 追加到原备注。
+            # ONES follow-up 由本命令末尾统一发一次需求同步，此处不重复入队。
+            _result = apply_flow_set(
+                workspace,
+                feature,
+                _step_id,
+                "skipped",
+                note=(f"{_prior_note}；{_reason}" if _prior_note.strip() else _reason) if _satisfied else None,
+                force=not _satisfied,
+                reason=None if _satisfied else _reason,
+                trigger="complete",
+                no_ones_sync=True,
+            )
+            events.extend(_result.get("_events") or [])
+            archived_steps.append(
+                {"step": _step_id, "from_status": "pending", "to_status": "skipped", "reason": _reason}
+            )
+        if _narrowed_pending:
+            table = parse_pipeline_table(status_path)
+            rows = [row["cells"] for row in table["rows"]]
+        if _scale == "small":
+            ensure_design_tasks(
+                status_path,
+                "small",
+                [{"id": cells[0], "state": cells[4]} for cells in rows],
+            )
+        set_status_field(status_path, "状态", "已完成")
     # 点位 #7：flow complete 发 feature_completed（统计口径对齐 snapshot.py），
     # 随后作为 flush 点发 complete-flush 快照（事件原位产出，_events 契约）。
     completed_event = _emit_feature_completed(workspace, feature, status_path, rows)
@@ -2679,29 +3010,31 @@ def command_flow_archive(args: argparse.Namespace, *, dashboard_refresh: Callabl
     if feature is None:
         return 1
     status_path = status_path_for_feature(workspace, feature)
-    set_status_field(status_path, "状态", "已归档")
-    if args.reason:
-        lines = status_path.read_text(encoding="utf-8").splitlines()
-        start = next(
-            (index for index, line in enumerate(lines) if line.strip() == "## 进度概要"),
-            None,
-        )
-        note_line = f"- 归档备注: {args.reason.strip()}"
-        if start is None:
-            while lines and not lines[-1].strip():
-                lines.pop()
-            lines.extend(["", "## 进度概要", "", note_line])
-        else:
-            end = next(
-                (
-                    index
-                    for index in range(start + 1, len(lines))
-                    if lines[index].strip().startswith("## ")
-                ),
-                len(lines),
+    # 016 T-10（D-40）：状态字段与归档备注两次写持 STATUS 锁。
+    with flow_status_write_lock(status_path):
+        set_status_field(status_path, "状态", "已归档")
+        if args.reason:
+            lines = status_path.read_text(encoding="utf-8").splitlines()
+            start = next(
+                (index for index, line in enumerate(lines) if line.strip() == "## 进度概要"),
+                None,
             )
-            lines.insert(end, note_line)
-        atomic_write_text(status_path, "\n".join(lines) + "\n")
+            note_line = f"- 归档备注: {args.reason.strip()}"
+            if start is None:
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                lines.extend(["", "## 进度概要", "", note_line])
+            else:
+                end = next(
+                    (
+                        index
+                        for index in range(start + 1, len(lines))
+                        if lines[index].strip().startswith("## ")
+                    ),
+                    len(lines),
+                )
+                lines.insert(end, note_line)
+            atomic_write_text(status_path, "\n".join(lines) + "\n")
     # 点位 #8（D-7）：flow archive 成功后发 feature_archived(trigger=flow-archive)。
     events: list[dict[str, Any]] = [
         flow_emit_event(
@@ -3185,6 +3518,74 @@ def command_template(args: argparse.Namespace) -> int:
     return 0
 
 
+def _feature_init_routing_mode(workspace: Path) -> tuple[Any, BindingReceipt | None] | None:
+    """feature init 的路由判定（profile=None、不拉取、不调用识别器）。判定失败返回 None，按 legacy 原流程继续——
+    与 ``refresh_specrules`` 的 fail-open 口径一致；唯一例外与 ``setup`` 相同：项目显式写了 ``ruleSources.routing=auto``
+    时配置非法即失败关闭（explicit 永不 fail-open），异常原样抛出、不建 feature 目录。"""
+    project_config: dict[str, Any] = {}
+    try:
+        global_config, _ = load_config_file(Path.home() / ".config" / "devkit" / "config.json")
+        project_config, _ = load_config_file(workspace / CONFIG_PATH)
+        catalog = RuleSourceCatalog.fromConfig(global_config, project_config)
+        receipt = BindingReceipt.load(workspace)
+        decision = RuleSourceSelector().routingMode(
+            workspace, catalog, None, receipt, catalog.sourceDirs(), allowImplicitAdoption=False
+        )
+    except Exception:  # noqa: BLE001 - fail-open（explicit 除外）
+        rules = project_config.get("ruleSources") if isinstance(project_config, dict) else None
+        if isinstance(rules, dict) and rules.get("routing") == "auto":
+            raise
+        return None
+    return decision, receipt
+
+
+def feature_init_binding_check(workspace: Path) -> list[str]:
+    """BC-17：仅 ``adopted`` 时在产物落盘前校验绑定回执与当前画像指纹（设计 §4.7.1.3，接口 §2.5）。
+
+    - explicit：回执缺失 / 不可读（写了 routing=auto 尚未 setup）或指纹不一致 → ``RULES_BINDING_STALE``（调用方
+      未建 feature 目录）；
+    - implicit：不一致只返回 warning 与「重新执行 setup」建议；
+    - 当前识别 ``budget-exhausted``：不做一致性判定，只告警；识别本身抛异常时 implicit 只告警、explicit 原样抛出；
+    - legacy / disabled：不调用识别器、不写画像缓存，返回 []（输出与 2.45.0 相同）。
+    """
+    routed = _feature_init_routing_mode(workspace)
+    if routed is None:
+        return []
+    decision, receipt = routed
+    if decision.mode != "adopted":
+        return []
+    explicit = decision.adoptedBy == "explicit"
+    if receipt is None or not receipt.readable:
+        if explicit:
+            problem = "绑定回执缺失" if receipt is None else f"绑定回执不可读（{receipt.problem}）"
+            raise DevkitFlowError(
+                f"{problem}：ruleSources.routing=auto 已写入但尚未完成 setup；先执行 devkit-flow setup 再 feature init",
+                error_code=RULES_BINDING_STALE,
+            )
+        return [f"绑定回执不可读（{receipt.problem if receipt else 'missing'}），未校验绑定指纹；重新执行 setup 重写回执"]
+    try:
+        profile = ProjectDetector().detect(workspace)
+    except Exception as error:  # noqa: BLE001 - implicit 只告警（arch P2-10）；explicit 失败关闭
+        if explicit:
+            raise
+        return [f"项目识别失败（{compact_error(error)}），未校验绑定指纹；修复后重新执行 setup"]
+    if profile.budget.exhausted or profile.status == "budget-exhausted":
+        return ["识别预算耗尽，未校验绑定指纹"]
+    try:
+        ProfileCache().write(profile)
+    except OSError:
+        pass
+    if profile.fingerprint == receipt.profileFingerprint:
+        return []
+    message = "当前项目画像指纹与绑定回执不一致（项目结构已变化）"
+    if explicit:
+        raise DevkitFlowError(
+            f"{message}：重新执行 devkit-flow setup 校验并重挂规则后再 feature init",
+            error_code=RULES_BINDING_STALE,
+        )
+    return [f"{message}；沿用现有规则树继续，重新执行 setup 更新绑定"]
+
+
 def command_feature_init(args: argparse.Namespace, *, side_effects: WriteSideEffects | None = None) -> int:
     workspace = Path.cwd()
     name = args.name.strip()
@@ -3206,6 +3607,9 @@ def command_feature_init(args: argparse.Namespace, *, side_effects: WriteSideEff
         )
         if clash is not None:
             raise DevkitFlowError(f"已存在同名 feature 目录: {clash.relative_to(workspace)}。")
+
+    # 016 T-05（BC-17）：adopted 下绑定回执 / 指纹校验先于任何产物落盘；legacy / disabled 返回 [] 且无副作用
+    rule_warnings = feature_init_binding_check(workspace)
 
     branch = ""
     git_result = subprocess.run(
@@ -3268,6 +3672,10 @@ def command_feature_init(args: argparse.Namespace, *, side_effects: WriteSideEff
         "config_snapshot": snapshot.as_json(),
         "specrules_refresh": specrules_refresh,
     }
+    if rule_warnings:
+        data["warnings"] = rule_warnings
+        # arch P2-11：text 输出只打印 message，告警须同时进 message 才可见（仅 adopted 下出现，legacy 输出不变）
+        data["message"] += "".join(f"\nwarning: {item}" for item in rule_warnings)
     # 点位 #9（D-7）：feature init 发 feature_started(trigger=feature-init)。
     started_feature = {
         "feature": name,
@@ -3300,46 +3708,48 @@ def command_flow_mode(args: argparse.Namespace, *, dashboard_refresh: Callable[[
     if feature is None:
         return 1
     status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
-    gate = next((row for row in table["rows"] if row["cells"][0] == "S0.5-H"), None)
-    if gate is None:
-        raise DevkitFlowError("流水线中不存在 S0.5-H（模式选择），无法确认模式。")
-    current_mode = feature["summary"].get("mode", "").strip()
-    if current_mode in FLOW_MODES:
-        raise DevkitFlowError(f"模式已设置为 {current_mode}，禁止重复执行 flow mode。")
-    if gate["cells"][4] != "waiting-confirmation":
-        raise DevkitFlowError(
-            f"S0.5-H 当前状态为 {gate['cells'][4]}，不是 waiting-confirmation，无法确认模式。"
+    # 016 T-10（D-40）：模式检查、S5.x 行插入、S0.5-H 置位与模式字段同处一个临界区；漏斗内锁可重入。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        gate = next((row for row in table["rows"] if row["cells"][0] == "S0.5-H"), None)
+        if gate is None:
+            raise DevkitFlowError("流水线中不存在 S0.5-H（模式选择），无法确认模式。")
+        current_mode = feature["summary"].get("mode", "").strip()
+        if current_mode in FLOW_MODES:
+            raise DevkitFlowError(f"模式已设置为 {current_mode}，禁止重复执行 flow mode。")
+        if gate["cells"][4] != "waiting-confirmation":
+            raise DevkitFlowError(
+                f"S0.5-H 当前状态为 {gate['cells'][4]}，不是 waiting-confirmation，无法确认模式。"
+            )
+        if any(re.fullmatch(r"S5\..+", row["cells"][0]) for row in table["rows"]):
+            raise DevkitFlowError("流水线中已存在 S5.x 模式行，禁止重复追加。")
+        s5_row = next((row for row in table["rows"] if row["cells"][0] == "S5"), None)
+        if s5_row is None:
+            raise DevkitFlowError("流水线中不存在 S5 行，无法追加模式行。")
+
+        snapshot = pipeline_config_snapshot(workspace)
+        # 016 F1-a：追加模式行时也必须按 scale 裁剪（此前只按配置门裁剪是 bug，导致 small 照拿 S5.7）。
+        # 用 canonical_effective_rows(scale, mode) 统一算 scale∪config 裁剪 + 依赖压缩，再取模式行区。
+        scale = feature_scale(feature)
+        mode_row_ids = {row[0] for row in PIPELINE_MODE_ROWS[args.mode]}
+        canonical = canonical_effective_rows(scale, args.mode, snapshot)
+        mode_rows = [row for row in canonical if row[0] in mode_row_ids]
+        lines = list(table["lines"])
+        insert_at = s5_row["line_index"] + 1
+        lines[insert_at:insert_at] = ["| " + " | ".join(row) + " |" for row in mode_rows]
+        atomic_write_text(status_path, "\n".join(lines) + "\n")
+
+        data = apply_flow_set(
+            workspace,
+            feature,
+            "S0.5-H",
+            "done",
+            confirmed=True,
+            trigger="mode",
+            dashboard_refresh=dashboard_refresh,
+            no_ones_sync=_no_ones_sync(args),
         )
-    if any(re.fullmatch(r"S5\..+", row["cells"][0]) for row in table["rows"]):
-        raise DevkitFlowError("流水线中已存在 S5.x 模式行，禁止重复追加。")
-    s5_row = next((row for row in table["rows"] if row["cells"][0] == "S5"), None)
-    if s5_row is None:
-        raise DevkitFlowError("流水线中不存在 S5 行，无法追加模式行。")
-
-    snapshot = pipeline_config_snapshot(workspace)
-    # 016 F1-a：追加模式行时也必须按 scale 裁剪（此前只按配置门裁剪是 bug，导致 small 照拿 S5.7）。
-    # 用 canonical_effective_rows(scale, mode) 统一算 scale∪config 裁剪 + 依赖压缩，再取模式行区。
-    scale = feature_scale(feature)
-    mode_row_ids = {row[0] for row in PIPELINE_MODE_ROWS[args.mode]}
-    canonical = canonical_effective_rows(scale, args.mode, snapshot)
-    mode_rows = [row for row in canonical if row[0] in mode_row_ids]
-    lines = list(table["lines"])
-    insert_at = s5_row["line_index"] + 1
-    lines[insert_at:insert_at] = ["| " + " | ".join(row) + " |" for row in mode_rows]
-    atomic_write_text(status_path, "\n".join(lines) + "\n")
-
-    data = apply_flow_set(
-        workspace,
-        feature,
-        "S0.5-H",
-        "done",
-        confirmed=True,
-        trigger="mode",
-        dashboard_refresh=dashboard_refresh,
-        no_ones_sync=_no_ones_sync(args),
-    )
-    set_status_field(status_path, "模式", args.mode)
+        set_status_field(status_path, "模式", args.mode)
     data["message"] = (
         f"模式已确认为 {args.mode}：S5.x 模式行已追加，S0.5-H 已置 done，进度概要已重算。"
     )
@@ -3469,79 +3879,81 @@ def command_flow_migrate_steps(
     if feature is None:
         return 1
     status_path = status_path_for_feature(workspace, feature)
-    table = parse_pipeline_table(status_path)
-    if not any(line.strip() == "## 流水线" for line in table["lines"]):
-        raise DevkitFlowError("STATUS.md 无流水线表，无法执行 flow migrate-steps。")
+    # 016 T-10（D-40）：读-比对-写持 STATUS 锁（dry-run 同样在锁内读取一致快照）。
+    with flow_status_write_lock(status_path):
+        table = parse_pipeline_table(status_path)
+        if not any(line.strip() == "## 流水线" for line in table["lines"]):
+            raise DevkitFlowError("STATUS.md 无流水线表，无法执行 flow migrate-steps。")
 
-    scale = feature_scale(feature, allow_empty=False)  # 016 D-40/D-42：写命令空值 fail-closed，不按 large 插行
-    mode = feature_resolved_mode(table, feature)
-    snapshot = pipeline_config_snapshot(workspace)
-    dry_run = bool(getattr(args, "dry_run", False))
+        scale = feature_scale(feature, allow_empty=False)  # 016 D-40/D-42：写命令空值 fail-closed，不按 large 插行
+        mode = feature_resolved_mode(table, feature)
+        snapshot = pipeline_config_snapshot(workspace)
+        dry_run = bool(getattr(args, "dry_run", False))
 
-    existing_ids: list[str] = []
-    id_to_line: dict[str, int] = {}
-    row_by_id: dict[str, dict[str, Any]] = {}
-    for row in table["rows"]:
-        step_id = row["cells"][0]
-        existing_ids.append(step_id)
-        if step_id not in id_to_line:
-            id_to_line[step_id] = row["line_index"]
-            row_by_id[step_id] = row
-    existing_set = set(existing_ids)
+        existing_ids: list[str] = []
+        id_to_line: dict[str, int] = {}
+        row_by_id: dict[str, dict[str, Any]] = {}
+        for row in table["rows"]:
+            step_id = row["cells"][0]
+            existing_ids.append(step_id)
+            if step_id not in id_to_line:
+                id_to_line[step_id] = row["line_index"]
+                row_by_id[step_id] = row
+        existing_set = set(existing_ids)
 
-    canonical = canonical_effective_rows(scale, mode, snapshot)
-    missing_rows = missing_required_rows(existing_ids, scale, mode, snapshot)
-    pending_inserts = {row[0]: list(row) for row in missing_rows}
-    inserted_ids_set = set(pending_inserts)
+        canonical = canonical_effective_rows(scale, mode, snapshot)
+        missing_rows = missing_required_rows(existing_ids, scale, mode, snapshot)
+        pending_inserts = {row[0]: list(row) for row in missing_rows}
+        inserted_ids_set = set(pending_inserts)
 
-    lines = list(table["lines"])
-    last_line = _pipeline_anchor_index(lines)
-    inserted_ids: list[str] = []
-    already_present: list[str] = []
-    rewritten: list[DependencyRewrite] = []
+        lines = list(table["lines"])
+        last_line = _pipeline_anchor_index(lines)
+        inserted_ids: list[str] = []
+        already_present: list[str] = []
+        rewritten: list[DependencyRewrite] = []
 
-    for canon_row in canonical:
-        step_id = canon_row[0]
-        if step_id in id_to_line:
-            already_present.append(step_id)
-            last_line = id_to_line[step_id]
-            old_dep = row_by_id[step_id]["cells"][3]
-            new_dep = canon_row[3]
-            if _should_rewrite_dependency(step_id, old_dep, new_dep, inserted_ids_set):
-                cells = list(row_by_id[step_id]["cells"])
-                cells[3] = new_dep
-                lines[id_to_line[step_id]] = _render_pipeline_row(cells)
-                rewritten.append(
-                    DependencyRewrite(step=step_id, from_dep=old_dep, to_dep=new_dep)
+        for canon_row in canonical:
+            step_id = canon_row[0]
+            if step_id in id_to_line:
+                already_present.append(step_id)
+                last_line = id_to_line[step_id]
+                old_dep = row_by_id[step_id]["cells"][3]
+                new_dep = canon_row[3]
+                if _should_rewrite_dependency(step_id, old_dep, new_dep, inserted_ids_set):
+                    cells = list(row_by_id[step_id]["cells"])
+                    cells[3] = new_dep
+                    lines[id_to_line[step_id]] = _render_pipeline_row(cells)
+                    rewritten.append(
+                        DependencyRewrite(step=step_id, from_dep=old_dep, to_dep=new_dep)
+                    )
+                continue
+            insert_row = pending_inserts.get(step_id)
+            if insert_row is None:
+                continue
+            cells = list(insert_row)
+            if len(cells) < 6:
+                cells.extend([""] * (6 - len(cells)))
+            cells[4] = "pending"
+            insert_at = last_line + 1
+            lines.insert(insert_at, _render_pipeline_row(cells))
+            for tracked_id, tracked_index in list(id_to_line.items()):
+                if tracked_index >= insert_at:
+                    id_to_line[tracked_id] = tracked_index + 1
+            id_to_line[step_id] = insert_at
+            last_line = insert_at
+            inserted_ids.append(step_id)
+
+        skipped_disabled = _skipped_disabled_steps(mode, snapshot, existing_set)
+        wrote = False
+        new_text = "\n".join(lines) + "\n"
+        old_text = "\n".join(table["lines"]) + "\n"
+        if not dry_run and new_text != old_text:
+            atomic_write_text(status_path, new_text)
+            wrote = True
+            if inserted_ids:
+                rewrite_progress_summary(
+                    status_path, progress_summary_values(parse_pipeline_table(status_path))
                 )
-            continue
-        insert_row = pending_inserts.get(step_id)
-        if insert_row is None:
-            continue
-        cells = list(insert_row)
-        if len(cells) < 6:
-            cells.extend([""] * (6 - len(cells)))
-        cells[4] = "pending"
-        insert_at = last_line + 1
-        lines.insert(insert_at, _render_pipeline_row(cells))
-        for tracked_id, tracked_index in list(id_to_line.items()):
-            if tracked_index >= insert_at:
-                id_to_line[tracked_id] = tracked_index + 1
-        id_to_line[step_id] = insert_at
-        last_line = insert_at
-        inserted_ids.append(step_id)
-
-    skipped_disabled = _skipped_disabled_steps(mode, snapshot, existing_set)
-    wrote = False
-    new_text = "\n".join(lines) + "\n"
-    old_text = "\n".join(table["lines"]) + "\n"
-    if not dry_run and new_text != old_text:
-        atomic_write_text(status_path, new_text)
-        wrote = True
-        if inserted_ids:
-            rewrite_progress_summary(
-                status_path, progress_summary_values(parse_pipeline_table(status_path))
-            )
 
     data: dict[str, Any] = {
         "status": "ok",

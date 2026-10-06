@@ -8,18 +8,53 @@ import shutil
 from pathlib import Path
 from typing import Any
 from devkit_flow.codex_agents import codex_agent_registration_check, codex_user_home
-from devkit_flow.config import context_source_summary, format_review_gate_timing_status_text, kba_context_source_doctor, load_review_gate_timing_summary, ones_config_summary
-from devkit_flow.constants import AGENT_DATA_PAYLOAD_FILES, DEVKIT_CLI_RELATIVE_PATH, LEGACY_RUNTIME_PLUGIN_NAMES, RUNTIME_PLUGIN_NAME, SPECRULES_CLEANUP_BACKUP_NAME, SPECRULES_CLEANUP_MANUAL, SPECRULES_DISABLED_NO_TREE, SPECRULES_DISABLED_REMOVED, SPECRULES_REFRESH_GIT_TIMEOUT_SECONDS, SPECRULES_REPO_URL, SPECRULES_SETUP_ILLEGAL_REASON, SPECRULES_URL_SWITCH_BACKUP_NAME, TELEMETRY_SSO_IDENTITY_CACHE_RELATIVE_PATH, _SPECRULES_GITMODULES_PATH
+from devkit_flow.config import context_source_summary, format_review_gate_timing_status_text, kba_context_source_doctor, load_config_file, load_review_gate_timing_summary, ones_config_summary, specrules_cache_dir_for_url, validate_specrules_git_url
+from devkit_flow.constants import CONFIG_PATH, AGENT_DATA_PAYLOAD_FILES, DEVKIT_CLI_RELATIVE_PATH, LEGACY_RUNTIME_PLUGIN_NAMES, RUNTIME_PLUGIN_NAME, SPECRULES_CLEANUP_BACKUP_NAME, SPECRULES_CLEANUP_MANUAL, SPECRULES_DISABLED_NO_TREE, SPECRULES_DISABLED_REMOVED, SPECRULES_REFRESH_GIT_TIMEOUT_SECONDS, SPECRULES_REPO_URL, SPECRULES_SETUP_ILLEGAL_REASON, SPECRULES_URL_SWITCH_BACKUP_NAME, TELEMETRY_SSO_IDENTITY_CACHE_RELATIVE_PATH, _SPECRULES_GITMODULES_PATH
 from devkit_flow.e2e import e2e_doctor
 from devkit_flow.errors import DevkitFlowError
 from devkit_flow.html_ui import html_ui_doctor
 from devkit_flow.models import SpecrulesResolution, UserStopHookEntry, UserStopHookScan
+from devkit_flow.project_detect import ProfileCache, ProjectDetector, ProjectProfile
+from devkit_flow.rule_sources import (
+    RULE_BINDING_SCHEMA_VERSION,
+    RULE_PACKAGE_ENTRY,
+    RULES_ADVICE_NO_KIND,
+    RULES_BACKUP_RELATIVE_DIR,
+    RULES_BINDING_MISMATCH,
+    RULES_INCOMPATIBLE_SOURCE,
+    RULES_INCOMPLETE_SOURCE,
+    RULES_MIGRATION_CONFLICT,
+    RULES_MIGRATIONS_RELATIVE_DIR,
+    RULES_OK_STATUSES,
+    RULES_STATUS_ERROR_CODES,
+    RULES_TREE_NAME,
+    BindingReceipt,
+    ManagedFile,
+    ManagedTreeMigrator,
+    MigrationPlan,
+    MigrationReceipt,
+    RoutingDecision,
+    RuleBinding,
+    RuleClosureResolver,
+    RulePackageMeta,
+    RuleSourceCatalog,
+    RuleSourceSelector,
+    _rs_entry_digest,
+    _rs_lenient_package_fields,
+    _rs_now_iso,
+    _rs_now_stamp,
+    _rs_tree_files,
+    _rs_validate_source,
+    hold_bindings,
+    legacy_refresh_guard,
+)
 from devkit_flow.review import design_template_doctor, design_template_summary, docs_curator_doctor, review_rounds_doctor, review_rounds_summary
-from devkit_flow.selfupdate import extract_embedded_version, find_global_cli
-from devkit_flow.switches import docs_curator_summary, html_ui_summary, resolve_specrules, spec_artifacts_doctor, spec_artifacts_summary, specrules_cache_dir_for_url, specrules_doctor, specrules_summary, validate_specrules_git_url
+from devkit_flow.selfupdate import cli_code_path, extract_embedded_version, find_global_cli
+from devkit_flow.status_cmd import assemble_version_provenance, doctor_detect_project, doctor_project_detection, doctor_rule_binding, doctor_runtime_transactions, relate_source_checkout
+from devkit_flow.switches import docs_curator_summary, html_ui_summary, resolve_specrules, spec_artifacts_doctor, spec_artifacts_summary, specrules_doctor, specrules_summary
 from devkit_flow.templates_md import PROJECT_RULES_TEMPLATE, WORKSPACE_ROUTING_TEMPLATE
 from devkit_flow.telemetry import offer_sso_login, telemetry_doctor_check
-from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, run_external, sha256_file
+from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, load_support_file_readonly, run_external, runtime_support_root, sha256_file
 from devkit_flow.version import NPM_PACKAGE_NAME, NPM_REGISTRY, VERSION
 from devkit_flow.workflow_auto import workflow_auto_takeover_doctor_message, workflow_auto_takeover_summary
 
@@ -39,46 +74,96 @@ def specrules_cache_dir(url: str = SPECRULES_REPO_URL) -> Path:
     return specrules_cache_dir_for_url(url)
 
 
-def _single_line_git_diagnostic(raw: str, *, limit: int) -> str:
-    """Return a bounded Git diagnostic without common credential values.
+_GIT_COMMAND_PREFIX = "git command exited non-zero"
+# D-56：与 scripts/runtime_cli/host_diagnostics.py 同一提取器，按文件路径只读加载（不写 bytecode、不执行包 __init__）。
+_HOST_DIAGNOSTICS: Any = None
 
-    Redaction deliberately happens before whitespace compaction and truncation so
-    a credential cannot survive merely because its label fell outside the final
-    summary window. This helper only changes presentation; callers retain their
-    existing status, exit and cache-fallback semantics.
+
+def _host_diagnostics_module() -> Any:
+    """Load the shared whitelist extractor by file path. A load failure returns None."""
+    global _HOST_DIAGNOSTICS
+    if _HOST_DIAGNOSTICS is not None:
+        return _HOST_DIAGNOSTICS
+    try:
+        support = runtime_support_root("runtime_cli")
+        if support is None:
+            return None
+        module = load_support_file_readonly(
+            support,
+            "runtime_cli/host_diagnostics.py",
+            "devkit_setup_host_diagnostics",
+        )
+    except (ImportError, OSError, SyntaxError):
+        return None
+    _HOST_DIAGNOSTICS = module
+    return module
+
+
+def _git_host_diagnostics(
+    stderr: str | bytes | None,
+    stdout: str | bytes | None = None,
+    *,
+    returncode: int | None = None,
+) -> Any:
+    """``HostDiagnostics`` for a failed Git command, or None when the extractor is unavailable.
+
+    Same split as ``workspace_sync._host_output_diagnostics``: host text only decides which
+    closed-enumeration members occurred; it is never copied into any output.
     """
-    diagnostic = raw
-    diagnostic = re.sub(
-        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+(?::[^/@\s]*)?@",
-        r"\1[REDACTED]@",
-        diagnostic,
-    )
-    diagnostic = re.sub(
-        r"(?i)([?&](?:access_?token|token|password|secret|cookie)=)[^&\s]+",
-        r"\1[REDACTED]",
-        diagnostic,
-    )
-    diagnostic = re.sub(
-        r"(?im)(\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*",
-        r"\1[REDACTED]",
-        diagnostic,
-    )
-    diagnostic = re.sub(
-        r"(?i)(\b(?:bearer|basic)\s+)[^\s,;]+",
-        r"\1[REDACTED]",
-        diagnostic,
-    )
-    diagnostic = re.sub(
-        r"(?im)(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]*",
-        r"\1[REDACTED]",
-        diagnostic,
-    )
-    return " ".join(diagnostic.split())[:limit]
+    module = _host_diagnostics_module()
+    if module is None:
+        return None
+    return module.HostDiagnosticExtractor.extract(stdout, stderr, returncode=returncode)
+
+
+def _single_line_git_diagnostic(
+    stderr: str | bytes | None,
+    stdout: str | bytes | None = None,
+    *,
+    returncode: int | None = None,
+    limit: int,
+) -> str:
+    """Render a Git failure from closed-enumeration fields only (D-56).
+
+    ``limit`` is the whole-string budget; fields that do not fit are omitted
+    whole (values are never truncated). Without the extractor only the constant
+    prefix and the exit code are rendered. Callers keep their existing status,
+    exit and cache-fallback semantics.
+    """
+    module = _host_diagnostics_module()
+    if module is None:
+        if isinstance(returncode, int) and not isinstance(returncode, bool) and returncode >= 0:
+            return f"{_GIT_COMMAND_PREFIX} (exit {returncode})"
+        return _GIT_COMMAND_PREFIX
+    diagnostics = _git_host_diagnostics(stderr, stdout, returncode=returncode)
+    return module.render_host_failure_detail(_GIT_COMMAND_PREFIX, diagnostics, max_length=limit)
 
 
 def _git_result_diagnostic(result: Any, *, limit: int) -> str:
-    raw = result.stderr or result.stdout or f"exit {result.returncode}"
-    return _single_line_git_diagnostic(raw, limit=limit)
+    return _single_line_git_diagnostic(
+        getattr(result, "stderr", None),
+        getattr(result, "stdout", None),
+        returncode=getattr(result, "returncode", None),
+        limit=limit,
+    )
+
+
+def source_checkout_for(workspace: Path, cli_version: str) -> dict[str, Any]:
+    """Read only ``<workspace>/src/devkit_flow/version.py``. A missing file stays not-applicable."""
+    path = Path(workspace) / "src" / "devkit_flow" / "version.py"
+    try:
+        exists = path.is_file()
+    except OSError:
+        exists = False
+    if not exists:
+        return {"state": "not-applicable", "source_version": None, "relation": None}
+    return relate_source_checkout(extract_embedded_version(path), cli_version)
+
+
+def doctor_version_provenance(workspace: Path, cli_version: str | None = None) -> dict[str, Any]:
+    version = VERSION if cli_version is None else cli_version
+    checkout = source_checkout_for(workspace, version)
+    return assemble_version_provenance(Path(workspace), version, checkout)
 
 
 def _specrules_cache_origin_path(cache: Path) -> Path:
@@ -424,20 +509,34 @@ def refresh_specrules(workspace: Path) -> dict[str, Any]:
             "action": "skipped-not-mounted",
             "message": "specrules is not mounted; run devkit-flow setup",
         }
+    # 016 T-05：规则路由判定（读配置 / 回执 / routingMode / legacyTreeAtRisk）整段异常捕获——任何异常按 2.45.0
+    # 路径继续刷新，结果形状不变，只在 message 末尾附说明（Never raises）。
+    routing_note = ""
+    try:
+        skipped = legacy_refresh_guard(root)
+    except Exception as error:  # noqa: BLE001 - fail-open：判定失败按原方式刷新
+        skipped = None
+        routing_note = f"; 规则路由判定失败，已按原方式刷新：{compact_error(error)}"
+    if skipped is not None:
+        return skipped
     repo_url = resolution.repo_url or SPECRULES_REPO_URL
     specrules_dir = root / "specrules"
     try:
         if resolution.workspace_tree == "submodule":
-            return _refresh_specrules_submodule(root, specrules_dir, repo_url)
-        return _refresh_specrules_copy(root, specrules_dir, repo_url)
+            result = _refresh_specrules_submodule(root, specrules_dir, repo_url)
+        else:
+            result = _refresh_specrules_copy(root, specrules_dir, repo_url)
     except Exception as error:
         index_ok = (specrules_dir / "rules" / "index.md").is_file()
-        return {
+        result = {
             "status": "current" if index_ok else "error",
             "action": "refresh-failed",
             "message": compact_error(error),
             "repo_url": repo_url,
         }
+    if routing_note:
+        result["message"] = f"{result.get('message') or ''}{routing_note}"
+    return result
 
 
 def resolve_agents_source() -> tuple[Path | None, str]:
@@ -450,8 +549,8 @@ def resolve_agents_source() -> tuple[Path | None, str]:
         env_note = f"DEVKIT_AGENTS_SOURCE={candidate} is not a directory; "
     else:
         env_note = ""
-    # npm 全局安装时，__file__ 解析到 <npm-global>/node_modules/devkit-flow/devkit-flow，
-    # 数据目录 agents/ 与该文件同包同级。
+    # npm 全局安装时，__file__ 解析到 <npm-global>/node_modules/devkit-flow/devkit_flow_main.py
+    # （由同目录薄启动器 devkit-flow 加载，BC-23），数据目录 agents/ 与该文件同包同级。
     npm_candidate = current_cli_path().parent / "agents"
     if npm_candidate.is_dir():
         return npm_candidate, f"npm package {npm_candidate}"
@@ -734,6 +833,7 @@ def setup_specrules_submodule(
     specrules_dir: Path,
     *,
     repo_url: str = SPECRULES_REPO_URL,
+    cache_skip_pull: bool | None = None,
 ) -> dict[str, Any]:
     """submodule 模式挂载 specrules/。
 
@@ -743,6 +843,10 @@ def setup_specrules_submodule(
     - 存量普通目录 → 与生效 URL 缓存零差异才转换（改名备份 → add → 清理，失败回滚目录），
       有任何差异或用户额外文件则拒绝迁移并给出指引；
     - 不存在 → ensure_specrules_cache 后 submodule add 生效 URL（需网络，--skip-specrules-pull 时报错）。
+
+    ``cache_skip_pull``（016 T-05，``RuleMountExecutor`` 传入）：只覆盖本函数内 ``ensure_specrules_cache`` 的
+    ``skip_pull``（同一次 setup 已拉取过该 URL 时不再 pull）；需要网络的 submodule 操作仍按
+    ``args.skip_specrules_pull`` 判定。缺省 None 时与 2.45.0 完全相同。
     """
     git = shutil.which("git")
     if not git:
@@ -809,7 +913,9 @@ def setup_specrules_submodule(
             git, workspace, specrules_dir, old_url=current_url, new_url=repo_url
         )
 
-    cache_ok, note = ensure_specrules_cache(args.skip_specrules_pull, repo_url)
+    cache_ok, note = ensure_specrules_cache(
+        args.skip_specrules_pull if cache_skip_pull is None else cache_skip_pull, repo_url
+    )
     cache = specrules_cache_dir(repo_url)
     if not cache_ok:
         return setup_action("specrules", specrules_dir, workspace, "error", note)
@@ -1033,6 +1139,1307 @@ def cleanup_specrules_tree(workspace: Path, resolution: SpecrulesResolution) -> 
     return _cleanup_specrules_directory(workspace, specrules_dir, resolution)
 
 
+# ---------------------------------------------------------------------------
+# 016 T-05：规则源路由接入 setup（设计 §4.2.1、§4.7.1.3～§4.7.1.5，接口 §2.5 / §8.3 / §8.4）
+# ---------------------------------------------------------------------------
+
+RULES_STAGING_RELATIVE_DIR = Path(".devkit") / "specrules-staging"
+# 成功挂上默认源时沿用原句。默认源也失败时由 reconcile_legacy_fallback_advice 换成与实际一致的句子（G-10）。
+RULES_ADVICE_PULL_FAILED_MOUNTED = (
+    "本次已按旧路径挂载默认 Java 规则，之后不会自动重试隐式采用。"
+    "修复后执行 specrules catalog configure --routing auto 再 setup（会备份现有树）"
+)
+RULES_ADVICE_PULL_FAILED = "{kind} 源拉取失败：{reason}；" + RULES_ADVICE_PULL_FAILED_MOUNTED
+RULES_ADVICE_IMPLICIT_LEGACY_MOUNTED = "已按旧路径挂载（与 2.45.0 一致）"
+RULES_ADVICE_NON_JAVA_GUARD = (
+    "现有 specrules/ 声明了非 Java 规则包且绑定回执缺失：保留现有规则树、不覆盖。"
+    "执行 specrules catalog configure --routing auto 后 setup 恢复采用；"
+    "或 --routing legacy 后 setup 显式回到 Java 规则（自动备份或记录现有树）"
+)
+
+
+RULES_NOTE_REUSED_CACHE = "reused the rule cache pulled earlier in this setup"
+RULES_FALLBACK_COPY_ON_SUBMODULE = (
+    "specrules/ is a git submodule: explicit legacy fallback with --specrules-mode copy would overwrite files inside "
+    "the submodule and is refused; re-run setup without --specrules-mode copy (switches the submodule back to the "
+    "Java source), or remove the submodule first (git submodule deinit -f specrules && git rm -f specrules) and setup again"
+)
+
+
+class RuleMountFailure(Exception):
+    """``RuleMountExecutor.mount`` 的挂载失败（拉取 / 校验 / 换树失败）；原树已按备份还原或未被改动。
+
+    ``rollback_problems`` 非空表示挂载失败后执行方内部的撤销本身也未完成（双重故障，Claude R2-P2-b）：问题项结构化上传，
+    由 ``SetupRuleRouting._mount_all`` 与外层回滚的问题合并，不得再声称原树未改动。"""
+
+    def __init__(self, message: str, *, error_code: str | None = None, rollback_problems: list[str] | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.rollback_problems = list(rollback_problems or [])
+
+
+def _mount_failure_code(reason: str) -> str:
+    """挂载失败无 ``RULES_*`` 码时的映射（arch P2-6，接口 §4.2）：submodule 脏 → 迁移冲突；其余（缓存不可用、拉取 /
+    检出失败、换树 IO 失败）→ 规则源未能完整挂载 ``RULES_INCOMPLETE_SOURCE``。不新增错误码（D-23）。"""
+    if "dirty" in reason or "local changes" in reason:
+        return RULES_MIGRATION_CONFLICT
+    return RULES_INCOMPLETE_SOURCE
+
+
+class _SubmoduleSnapshot:
+    """specrules submodule 的可恢复快照（D-35 ②、arch P2-3 / codex P2-1、codex R2 P1）：``.gitmodules`` 文本、父仓索引中
+    ``.gitmodules`` / ``specrules`` 两条记录（含 gitlink）、子模块检出提交与分支、挂载前树是否存在、
+    ``.git/modules/specrules`` 是否存在、``.git/config`` 中 ``submodule.specrules.*`` 全部条目、URL 切换备份目录是否存在。
+
+    ``restore`` 只撤销本次新建 / 改动的部分：挂载前无树时移除工作树；``.git/modules/specrules`` 仅在快照时不存在才删除
+    （工作目录缺失不代表子模块仓库是新建的——登记、gitlink 与仅本地的提交可能仍在，codex R2 P1）；``.git/config`` 子模块节
+    按快照原样重写（原本没有则删除）；已有树时按还原后的 ``.gitmodules`` 同步 URL 并检出原提交（原在分支上则回到该分支）。
+    不代 commit。
+    """
+
+    PATHS = (".gitmodules", RULES_TREE_NAME)
+
+    def __init__(self, git: str, workspace: Path, *, treeExisted: bool, gitmodules: str | None,
+                 indexEntries: dict[str, tuple[str, str]], head: str | None, headRef: str | None = None,
+                 modulesDir: Path | None = None, modulesExisted: bool = False,
+                 configEntries: list[tuple[str, str]] | None = None, switchBackupExisted: bool = False,
+                 modulesHead: str | None = None, modulesOrigin: str | None = None):
+        self.git = git
+        self.workspace = workspace
+        self.treeExisted = treeExisted
+        self.gitmodules = gitmodules
+        self.indexEntries = indexEntries
+        self.head = head
+        self.headRef = headRef
+        self.modulesDir = modulesDir
+        self.modulesExisted = modulesExisted
+        self.configEntries = list(configEntries or [])
+        self.switchBackupExisted = switchBackupExisted
+        # 工作树缺失、子模块仓库仍在时：仓库 HEAD 原文（分支引用或提交号）与 remote.origin.url
+        self.modulesHead = modulesHead
+        self.modulesOrigin = modulesOrigin
+
+    @classmethod
+    def capture(cls, workspace: Path) -> "_SubmoduleSnapshot | None":
+        git = shutil.which("git")
+        if not git:
+            return None
+        probe = run_external([git, "-C", str(workspace), "rev-parse", "--is-inside-work-tree"], check=False)
+        if probe.returncode != 0:
+            return None
+        tree = workspace / RULES_TREE_NAME
+        gitmodules = workspace / ".gitmodules"
+        try:
+            text = gitmodules.read_text(encoding="utf-8") if gitmodules.is_file() else None
+        except (OSError, UnicodeDecodeError):
+            text = None
+        entries: dict[str, tuple[str, str]] = {}
+        listing = run_external([git, "-C", str(workspace), "ls-files", "-s", "--", *cls.PATHS], check=False)
+        for line in (listing.stdout or "").splitlines():
+            meta, _, path = line.partition("\t")
+            parts = meta.split()
+            if path in cls.PATHS and len(parts) >= 2:
+                entries[path] = (parts[0], parts[1])
+        head = headRef = None
+        if os.path.lexists(tree / ".git"):
+            head = _specrules_git_sha(git, tree)
+            ref = run_external([git, "-C", str(tree), "symbolic-ref", "-q", "HEAD"], check=False)
+            headRef = (ref.stdout or "").strip() or None if ref.returncode == 0 else None
+        git_dir = (run_external([git, "-C", str(workspace), "rev-parse", "--git-dir"], check=False).stdout or "").strip()
+        modules_dir = None
+        if git_dir:
+            modules_dir = (Path(git_dir) if os.path.isabs(git_dir) else workspace / git_dir) / "modules" / RULES_TREE_NAME
+        modules_existed = modules_dir is not None and os.path.lexists(modules_dir)
+        modules_head = modules_origin = None
+        if modules_existed and modules_dir is not None and not os.path.lexists(tree):
+            modules_head = cls._read_head(modules_dir)
+            origin = run_external([git, "config", "--file", str(modules_dir / "config"), "--get", "remote.origin.url"], check=False)
+            modules_origin = (origin.stdout or "").strip() or None
+        config: list[tuple[str, str]] = []
+        listing = run_external(
+            [git, "-C", str(workspace), "config", "--local", "--get-regexp", rf"^submodule\.{RULES_TREE_NAME}\."], check=False
+        )
+        for line in (listing.stdout or "").splitlines():
+            key, _, value = line.partition(" ")
+            if key:
+                config.append((key, value))
+        return cls(
+            git,
+            workspace,
+            treeExisted=os.path.lexists(tree),
+            gitmodules=text,
+            indexEntries=entries,
+            head=head,
+            headRef=headRef,
+            modulesDir=modules_dir,
+            modulesExisted=modules_existed,
+            configEntries=config,
+            switchBackupExisted=os.path.lexists(workspace / SPECRULES_URL_SWITCH_BACKUP_NAME),
+            modulesHead=modules_head,
+            modulesOrigin=modules_origin,
+        )
+
+    @staticmethod
+    def _read_head(git_dir: Path) -> str | None:
+        try:
+            return (git_dir / "HEAD").read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    @property
+    def gitlink(self) -> str | None:
+        entry = self.indexEntries.get(RULES_TREE_NAME)
+        return entry[1] if entry is not None and entry[0] == "160000" else None
+
+    def _git(self, *args: str, cwd: Path | None = None) -> Any:
+        return run_external([self.git, "-C", str(cwd or self.workspace), *args], check=False)
+
+    def _restore_config(self, problems: list[str]) -> None:
+        section = f"submodule.{RULES_TREE_NAME}"
+        current = self._git("config", "--local", "--get-regexp", rf"^submodule\.{RULES_TREE_NAME}\.")
+        now = [tuple(line.partition(" ")[::2]) for line in (current.stdout or "").splitlines() if line.strip()]
+        if now == self.configEntries:
+            return
+        if now:
+            self._git("config", "--local", "--remove-section", section)
+        for key, value in self.configEntries:
+            if self._git("config", "--local", "--add", key, value).returncode != 0:
+                problems.append(f".git/config {key}")
+
+    def unchanged(self) -> bool:
+        """当前状态与快照逐项相同（未发生任何改动）时为真：失败发生在改动之前，无需撤销、也不应声称已回滚。"""
+        current = _SubmoduleSnapshot.capture(self.workspace)
+        if current is None:
+            return False
+        modules_head = self._read_head(self.modulesDir) if self.modulesHead and self.modulesDir is not None else None
+        return (
+            current.treeExisted == self.treeExisted
+            and current.gitmodules == self.gitmodules
+            and current.indexEntries == self.indexEntries
+            and current.head == self.head
+            and current.headRef == self.headRef
+            and current.modulesExisted == self.modulesExisted
+            and current.configEntries == self.configEntries
+            and current.switchBackupExisted == self.switchBackupExisted
+            and modules_head == self.modulesHead
+        )
+
+    def _restore_modules_repo(self, problems: list[str]) -> None:
+        """工作树原本缺失、子模块仓库原本存在：仓库保留不删，只把本次检出 / 切源改动的 HEAD 与 origin URL 放回原值。
+        工作树已移除时仓库的 ``core.worktree`` 指向不存在的目录，git 命令会失败——HEAD 直接按原文写回，配置用 ``--file``。"""
+        modules = self.modulesDir
+        if modules is None:
+            return
+        if self.modulesHead and self._read_head(modules) != self.modulesHead:
+            try:
+                atomic_write_text(modules / "HEAD", self.modulesHead + "\n")
+            except OSError as error:
+                problems.append(f"{modules} HEAD: {error}")
+        if self.modulesOrigin:
+            config = str(modules / "config")
+            current = run_external([self.git, "config", "--file", config, "--get", "remote.origin.url"], check=False)
+            if (current.stdout or "").strip() != self.modulesOrigin and run_external(
+                [self.git, "config", "--file", config, "remote.origin.url", self.modulesOrigin], check=False
+            ).returncode != 0:
+                problems.append(f"{modules} remote.origin.url")
+
+    def restore(self) -> list[str]:
+        """恢复快照；返回未能恢复的步骤（空列表 = 完整恢复）。"""
+        problems: list[str] = []
+        tree = self.workspace / RULES_TREE_NAME
+        try:
+            _restore_text_file(self.workspace / ".gitmodules", self.gitmodules)
+        except OSError as error:
+            problems.append(f".gitmodules: {error}")
+        switch_backup = self.workspace / SPECRULES_URL_SWITCH_BACKUP_NAME
+        if not self.switchBackupExisted and os.path.lexists(switch_backup):
+            # URL 切换原语中途异常留下的备份：原树缺失则放回原位，否则删除（子模块切换前已证明干净，内容可由 git 恢复）
+            try:
+                if self.treeExisted and not os.path.lexists(tree):
+                    switch_backup.rename(tree)
+                else:
+                    shutil.rmtree(switch_backup)
+            except OSError as error:
+                problems.append(f"{SPECRULES_URL_SWITCH_BACKUP_NAME}: {error}")
+        self._restore_config(problems)
+        if not self.treeExisted:
+            try:
+                if tree.is_symlink() or tree.is_file():
+                    tree.unlink()
+                elif tree.exists():
+                    shutil.rmtree(tree)
+            except OSError as error:
+                problems.append(f"{RULES_TREE_NAME}/: {error}")
+            if self.modulesDir is not None and not self.modulesExisted and os.path.lexists(self.modulesDir):
+                shutil.rmtree(self.modulesDir, ignore_errors=True)
+                if os.path.lexists(self.modulesDir):
+                    problems.append(f"remove {self.modulesDir}")
+            elif self.modulesDir is not None and self.modulesExisted:
+                self._restore_modules_repo(problems)
+        else:
+            if self._git("submodule", "sync", "--", RULES_TREE_NAME).returncode != 0:
+                problems.append("git submodule sync")
+            if self.head and os.path.lexists(tree / ".git"):
+                current = _specrules_git_sha(self.git, tree)
+                ref = self._git("symbolic-ref", "-q", "HEAD", cwd=tree)
+                current_ref = (ref.stdout or "").strip() or None if ref.returncode == 0 else None
+                if current != self.head or current_ref != self.headRef:
+                    branch = self.headRef[len("refs/heads/"):] if self.headRef and self.headRef.startswith("refs/heads/") else None
+                    if branch and _specrules_git_sha(self.git, tree, self.headRef) == self.head:
+                        target = ("checkout", "-q", branch)
+                    else:
+                        target = ("checkout", "-q", "--detach", self.head)
+                    if self._git(*target, cwd=tree).returncode != 0:
+                        problems.append(f"checkout {self.head[:12]}")
+        for path in self.PATHS:
+            entry = self.indexEntries.get(path)
+            if entry is not None:
+                result = self._git("update-index", "--add", "--cacheinfo", f"{entry[0]},{entry[1]},{path}")
+            else:
+                result = self._git("update-index", "--force-remove", "--", path)
+            if result.returncode != 0:
+                problems.append(f"index entry {path}")
+        return problems
+
+
+class _DevkitResidue:
+    """隐式首次采用回落时的「不留痕」（codex P2-5）：记录挂载前 ``.devkit/`` 及迁移 / 备份目录的状态，回落 legacy 时
+    删除本次 setup 新增的迁移回执与空目录，使工作区与 2.45.0 一致（失败原因已进 ``rule_routing.advice``）。
+    只按快照差集删除，绝不触碰用户已有文件（如 ``.devkit/config.json``）。"""
+
+    def __init__(self, workspace: Path):
+        self.workspace = workspace
+        self.devkitExisted = os.path.lexists(workspace / ".devkit")
+        self.dirs = {rel: os.path.lexists(workspace / rel) for rel in (RULES_MIGRATIONS_RELATIVE_DIR, RULES_BACKUP_RELATIVE_DIR, RULES_STAGING_RELATIVE_DIR)}
+        migrations = workspace / RULES_MIGRATIONS_RELATIVE_DIR
+        self.migrations = set(os.listdir(migrations)) if migrations.is_dir() else set()
+
+    def clean(self) -> None:
+        migrations = self.workspace / RULES_MIGRATIONS_RELATIVE_DIR
+        if migrations.is_dir():
+            for name in set(os.listdir(migrations)) - self.migrations:
+                try:
+                    (migrations / name).unlink()
+                except OSError:
+                    pass
+        for rel, existed in self.dirs.items():
+            if not existed:
+                try:
+                    (self.workspace / rel).rmdir()
+                except OSError:
+                    pass
+        if not self.devkitExisted:
+            try:
+                (self.workspace / ".devkit").rmdir()
+            except OSError:
+                pass
+
+
+def _rule_mount_rel(binding: RuleBinding) -> str:
+    entry = binding.entry or f"{RULES_TREE_NAME}/{RULE_PACKAGE_ENTRY}"
+    suffix = "/" + RULE_PACKAGE_ENTRY
+    return entry[: -len(suffix)] if entry.endswith(suffix) else RULES_TREE_NAME
+
+
+def _specrules_gitmodules_registered(workspace: Path) -> bool:
+    gitmodules = workspace / ".gitmodules"
+    try:
+        return gitmodules.is_file() and bool(_SPECRULES_GITMODULES_PATH.search(gitmodules.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _cache_commit(cache: Path) -> str | None:
+    """规则缓存当前提交（只读本地 git，不联网）；无 git 或非 git 目录返回 None。"""
+    git = shutil.which("git")
+    if not git or not (cache / ".git").exists():
+        return None
+    try:
+        return _specrules_git_sha(git, cache)
+    except Exception:  # noqa: BLE001 - 提交号只是回执元数据，取不到不影响挂载
+        return None
+
+
+def _rollback_incomplete_hint(problems: list[str]) -> str:
+    """挂载失败后回滚本身也未完成（双重故障，R2-P2-b）时的如实说明与恢复建议。"""
+    return (
+        f"回滚不完整（{'; '.join(problems)}）：规则树 / 子模块登记 / 绑定回执可能已部分改动，"
+        "请用 git status 与 git diff -- .gitmodules specrules .devkit 核对；子模块可 git checkout -- .gitmodules 后 "
+        "git submodule sync specrules && git submodule update --init specrules 回到已提交状态"
+    )
+
+
+class RuleMountExecutor:
+    """按 ``RuleSourceSelector.select`` 产出的绑定挂载规则包（设计 §4.7.1.5）。
+
+    复用既有挂载原语：取源用 ``ensure_specrules_cache``（``skipPull`` 为真时只用已有缓存，同一次 setup 已拉取过的
+    URL 不再 pull）；copy 分发把缓存拷到工作区内临时目录后交 ``ManagedTreeMigrator.commit`` 事务换树（备份 / 还原 /
+    写回执与迁移回执）；submodule 分发复用 ``setup_specrules_submodule``（含切源回滚、dirty 检查），切换后对检出树做
+    与缓存相同的源校验（kind / 协议 / 零链接），不合格按快照撤销 add / 切换；成功后填好绑定的受管清单（记录入口，
+    D-31 ④），绑定回执由 ``SetupRuleRouting._mount_all`` 在全部挂载成功后统一写入（内容不变不重写，D-32 ①、arch P2-4）。
+    """
+
+    def __init__(self, args: argparse.Namespace, workspace: Path, migrator: ManagedTreeMigrator):
+        self.args = args
+        self.workspace = workspace
+        self.migrator = migrator
+        # 最近一次 copy 挂载的备份目录（无原树或 no-op 时为 None），供多挂载点中途失败时回滚
+        self.lastBackup: Path | None = None
+        self.lastChanged = False
+        # 最近一次 copy 挂载写出的 applied 迁移回执（回滚时改写为 rolled-back，arch P2-9）
+        self.lastMigrationPath: Path | None = None
+        # 最近一次 submodule 挂载的撤销动作（后续步骤失败时由 _mount_all 回滚调用）
+        self.lastUndo: Any = None
+
+    def _note(self, text: str, skipPull: bool) -> str:
+        """``skipPull`` 来自本次 setup 已拉取过该 URL（而非用户传 ``--skip-specrules-pull``）时改写缓存说明（arch P2-7）。"""
+        if not skipPull or self.args.skip_specrules_pull:
+            return text
+        return text.replace("pull skipped (--skip-specrules-pull), using local cache", RULES_NOTE_REUSED_CACHE).replace(
+            "missing and --skip-specrules-pull given", "missing (the pull earlier in this setup did not produce it)"
+        )
+
+    def mount(
+        self,
+        binding: RuleBinding,
+        plan: MigrationPlan,
+        mountPoint: str,
+        skipPull: bool,
+        receipt: BindingReceipt,
+    ) -> dict[str, Any]:
+        url = binding.repoUrl or SPECRULES_REPO_URL
+        tree = self.workspace / mountPoint
+        self.lastBackup = None
+        self.lastChanged = False
+        self.lastMigrationPath = None
+        self.lastUndo = None
+        if binding.distribution == "submodule":
+            return self._mount_submodule(binding, url, tree, skipPull, receipt)
+        cache_ok, note = ensure_specrules_cache(skipPull, url)
+        note = self._note(note, skipPull)
+        cache = specrules_cache_dir(url)
+        if not cache_ok:
+            raise RuleMountFailure(note, error_code=RULES_INCOMPLETE_SOURCE)
+        status, meta, advice = _rs_validate_source(cache, binding.kind, explicit=True)
+        if status != "bound" or meta is None:
+            raise RuleMountFailure(
+                f"rule source {url} {status}: {'; '.join(advice) or 'validation failed'}",
+                error_code=RULES_STATUS_ERROR_CODES.get(status),
+            )
+        binding.packageVersion = meta.version
+        binding.protocol = meta.protocol
+        binding.commit = _cache_commit(cache)
+        binding.offline = bool(self.args.skip_specrules_pull)
+        staging_root = self.workspace / RULES_STAGING_RELATIVE_DIR
+        staged = staging_root / f"{_rs_now_stamp()}-{binding.module.replace('/', '_') or 'root'}"
+        existed = os.path.lexists(tree)
+        try:
+            staged.mkdir(parents=True, exist_ok=False)
+            copy_specrules_to_workspace(cache, staged)
+            unchanged = _rule_tree_digests(staged) if existed and plan.applicable and not plan.conflicts else None
+            if unchanged is not None and unchanged == _rule_tree_digests(tree):
+                # 已挂载树与源逐文件一致：不换树、不产生备份，只刷新回执中的受管清单（重复 setup 幂等）。
+                # 顺序沿用 _rule_tree_digests / _rs_tree_files 的插入序，与 commit 写入的清单一致；
+                # 按路径重排会让第二次 setup 因顺序不同重写回执。
+                binding.managedFiles = [ManagedFile(f"{mountPoint}/{rel}", digest) for rel, digest in unchanged.items()]
+                return setup_action(
+                    "specrules",
+                    tree,
+                    self.workspace,
+                    "skipped",
+                    f"{binding.kind} rules {meta.version or '-'} from {url} already mounted and up to date (copy, {note})",
+                )
+            migration = self.migrator.commit(plan, staged, receipt)
+            self.lastChanged = True
+            self.lastMigrationPath = self.migrator.lastMigrationPath
+            if migration.backupPath:
+                self.lastBackup = self.workspace / migration.backupPath.rstrip("/")
+        except DevkitFlowError as error:
+            raise RuleMountFailure(compact_error(error), error_code=error.error_code) from error
+        except OSError as error:
+            raise RuleMountFailure(f"rule tree swap failed: {error}", error_code=RULES_INCOMPLETE_SOURCE) from error
+        finally:
+            shutil.rmtree(staged, ignore_errors=True)
+            try:
+                staging_root.rmdir()
+            except OSError:
+                pass
+        backup = f"; previous tree backed up to {migration.backupPath}" if migration.backupPath else ""
+        return setup_action(
+            "specrules",
+            tree,
+            self.workspace,
+            "updated" if existed else "created",
+            f"mounted {binding.kind} rules {meta.version or '-'} from {url} (copy, {note}){backup}",
+        )
+
+    def _mount_submodule(
+        self, binding: RuleBinding, url: str, tree: Path, skipPull: bool, receipt: BindingReceipt
+    ) -> dict[str, Any]:
+        """submodule 分发挂载。撤销动作在拍快照后立即登记（codex R2 / arch P2-3 重开）：既有原语在 ``submodule add`` /
+        切源之后才返回的错误（如检出后缺 ``rules/index.md``）、原语内异常、切换后校验失败、记录清单失败，都按快照撤销；
+        撤销后清空 ``lastUndo``，避免 ``_mount_all`` 重复撤销。成功返回时 ``lastUndo`` 保留，供后续回执写入失败时回滚。"""
+        existed = os.path.lexists(tree)
+        snapshot = _SubmoduleSnapshot.capture(self.workspace)
+
+        def undo() -> list[str]:
+            if snapshot is not None:
+                return snapshot.restore()
+            if not existed and tree.is_dir() and not tree.is_symlink():
+                shutil.rmtree(tree, ignore_errors=True)  # 非 git 工作区：既有原语回退为全新 copy，移除即可
+            return []
+
+        self.lastUndo = undo
+        undo_problems: list[str] = []
+
+        def rolled_back(message: str) -> str:
+            """撤销并返回带结果的文案；撤销未完成的问题项记入 ``undo_problems``，由 ``failure`` 结构化上传（R2-P2-b）。"""
+            self.lastUndo = None
+            if snapshot is not None and snapshot.unchanged():
+                return message  # 失败发生在任何改动之前（如 dirty / 需联网）：无需撤销
+            try:
+                problems = undo()
+            except Exception as error:  # noqa: BLE001 - 撤销尽力而为，问题如实报告
+                problems = [compact_error(error)]
+            undo_problems.extend(f"submodule: {item}" for item in problems)
+            tail = "submodule change rolled back" if not problems else f"rollback incomplete ({'; '.join(problems)})"
+            return f"{message}; {tail}"
+
+        def failure(message: str, error_code: str | None) -> RuleMountFailure:
+            text = rolled_back(message)
+            return RuleMountFailure(text, error_code=error_code, rollback_problems=undo_problems)
+
+        try:
+            action = setup_specrules_submodule(
+                self.args, self.workspace, tree, repo_url=url, cache_skip_pull=skipPull or bool(self.args.skip_specrules_pull)
+            )
+        except Exception as error:  # noqa: BLE001 - 原语内异常（copytree / rename 等 OSError）同样按快照撤销
+            raise failure(
+                f"submodule mount failed: {type(error).__name__}: {compact_error(error)}", RULES_INCOMPLETE_SOURCE
+            ) from error
+        action["reason"] = self._note(action["reason"], skipPull)
+        if action["status"] == "error":
+            # 既有原语可能在 add / 切源之后才报错（未自行撤销 gitlink / .gitmodules / .git/modules）：按快照撤销
+            raise failure(action["reason"], _mount_failure_code(action["reason"]))
+        try:
+            # codex P2-1 / arch P2-3：检出树与缓存可能漂移——切换后按同一口径校验（kind / 协议 / 零链接），不合格撤销
+            status, meta, advice = _rs_validate_source(tree, binding.kind, explicit=True)
+            if status != "bound" or meta is None:
+                detail = "; ".join(advice) or "validation failed"
+                raise RuleMountFailure(
+                    f"rule source {url} checked out into specrules/ is {status}: {detail}",
+                    error_code=RULES_STATUS_ERROR_CODES.get(status, RULES_INCOMPATIBLE_SOURCE),
+                )
+            binding.packageVersion = meta.version
+            binding.protocol = meta.protocol
+            binding.offline = bool(self.args.skip_specrules_pull)
+            index = tree / RULE_PACKAGE_ENTRY
+            if not os.path.lexists(tree / ".git"):
+                # 非 git 工作区：setup_specrules_submodule 已按既有语义回退为 copy 拷贝（无原树时全新创建）——
+                # 回执如实记 copy 分发与完整受管清单，供后续迁移计划比对
+                binding.distribution = "copy"
+                binding.commit = _cache_commit(specrules_cache_dir(url))
+                binding.managedFiles = [
+                    ManagedFile(_rule_rel(path, self.workspace), _rs_entry_digest(path)) for path in _rs_tree_files(tree)
+                ]
+            else:
+                git = shutil.which("git")
+                binding.commit = _specrules_git_sha(git, tree) if git else None
+                binding.managedFiles = [ManagedFile(_rule_rel(index, self.workspace), sha256_file(index))]
+        except RuleMountFailure as error:
+            raise failure(str(error), error.error_code) from error
+        except OSError as error:
+            raise failure(f"cannot record mounted rule files: {error}", RULES_INCOMPLETE_SOURCE) from error
+        except Exception as error:  # noqa: BLE001 - 其余异常同样先撤销再上抛
+            raise failure(f"{type(error).__name__}: {compact_error(error)}", RULES_INCOMPLETE_SOURCE) from error
+        self.lastChanged = action["status"] != "skipped"
+        return action
+
+
+def _rule_rel(path: Path, base: Path) -> str:
+    return Path(os.path.relpath(path, base)).as_posix()
+
+
+def _rule_tree_digests(tree: Path) -> dict[str, str] | None:
+    """规则树全部条目 → 摘要（相对树根；符号链接按链接文本）；读取失败返回 None（按「有变化」处理）。"""
+    try:
+        return {_rule_rel(path, tree): _rs_entry_digest(path) for path in _rs_tree_files(tree)}
+    except OSError:
+        return None
+
+
+def _receipt_equivalent(previous: bytes | None, receipt: BindingReceipt) -> bool:
+    """回执内容（忽略 ``boundAt``）与磁盘上的旧回执一致时不重写，保证重复 setup 不改回执字节。"""
+    if previous is None:
+        return False
+    try:
+        old = json.loads(previous.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(old, dict):
+        return False
+    new = receipt.toJson()
+    old.pop("boundAt", None)
+    new.pop("boundAt", None)
+    return old == new
+
+
+class SetupRuleRouting:
+    """``setup`` 的规则源路由编排：读配置与回执 → 只读识别 → 第 5 步前拉取 → 六步判定 → 挂载或回落。
+
+    ``run`` 返回 specrules action；返回 None 表示走 2.45.0 原 resolve / mount（legacy 不变路径）。
+    """
+
+    def __init__(self, args: argparse.Namespace, workspace: Path, resolution: SpecrulesResolution):
+        self.args = args
+        self.workspace = workspace
+        self.resolution = resolution
+        self.selector = RuleSourceSelector()
+        self.catalog: RuleSourceCatalog | None = None
+        self.receipt: BindingReceipt | None = None
+        self.profile: ProjectProfile | None = None
+        self.decision = RoutingDecision("legacy", None, "legacy-default", [])
+        self.bindings: list[RuleBinding] = []
+        self.advice: list[str] = []
+        self.error_code: str | None = None
+        self.pulledUrls: set[str] = set()
+        self.pullFailures: list[str] = []
+        self.detectionError: str | None = None
+        self.configError: DevkitFlowError | None = None
+        self.engaged = False
+        # 显式 legacy 回退写出的 applied 迁移回执（放弃回退时 advice 提示一并删除，S-3）
+        self.fallbackMigrationPath: Path | None = None
+
+    # -- 判定 ----------------------------------------------------------------
+
+    def prepare(self) -> None:
+        global_config, _ = load_config_file(Path.home() / ".config" / "devkit" / "config.json")
+        project_config, _ = load_config_file(self.workspace / CONFIG_PATH)
+        try:
+            self.catalog = RuleSourceCatalog.fromConfig(global_config, project_config)
+        except DevkitFlowError as error:
+            rules = project_config.get("ruleSources") if isinstance(project_config, dict) else None
+            self.catalog = None
+            if isinstance(rules, dict) and rules.get("routing") == "auto":
+                # 显式采用的配置非法：失败关闭——由 run() 产出 specrules error action（保持 actions 形状，arch P2-13）
+                self.configError = error
+                self.decision = RoutingDecision("adopted", "explicit", "project-config", [])
+            else:
+                self.advice.append(f"规则路由配置无法解析，已按旧路径执行：{compact_error(error)}")
+        self.receipt = BindingReceipt.load(self.workspace)
+        try:
+            self.profile = ProjectDetector().detect(self.workspace)
+        except Exception as error:  # noqa: BLE001 - 识别失败只诊断，不阻断 legacy
+            self.profile = None
+            self.detectionError = compact_error(error)
+            self.advice.append(f"项目识别失败：{self.detectionError}")
+        if self.profile is not None and not self.profile.budget.exhausted:
+            try:
+                ProfileCache().write(self.profile)
+            except OSError:
+                pass  # 画像缓存只是加速，写失败不影响 setup
+        if self.catalog is None:
+            return
+        self._pull_for_implicit_adoption()
+        self.decision = self.selector.routingMode(
+            self.workspace,
+            self.catalog,
+            self.profile,
+            self.receipt,
+            self.catalog.sourceDirs(),
+            allowImplicitAdoption=True,
+        )
+        if self.pullFailures and self.decision.mode == "legacy":
+            self.decision.advice.extend(self.pullFailures)
+
+    def _pull_for_implicit_adoption(self) -> None:
+        """第 5 步条件 ①② 成立且画像 confirmed、每个非附属模块的 kind 都有用户写入源时，先拉取这些源到缓存
+        （``--skip-specrules-pull`` 时只用已有缓存）。2.45.0 输入没有 catalog 键，不会多出网络操作。"""
+        catalog, profile = self.catalog, self.profile
+        if (
+            catalog is None
+            or not catalog.specrulesEnabled
+            or catalog.routing is not None
+            or self.receipt is not None
+            or not catalog.hasUserCatalog()
+            or os.path.lexists(self.workspace / RULES_TREE_NAME)
+            or catalog.hasProjectSpecrulesConfig
+            or profile is None
+            or profile.status != "confirmed"
+        ):
+            return
+        for module in profile.modules:
+            if profile.status == "confirmed" and module.status != "confirmed":
+                continue  # D-25 附属模块不为其求 kind
+            kind = module.ruleKind()
+            if kind is None or not catalog.isUserConfigured(kind):
+                return  # 第 5 步条件 ③ 必然不成立：不联网
+        for kind in self.selector.implicitAdoptionKinds(profile, catalog):
+            url = catalog.urlFor(kind)
+            if url is None or url in self.pulledUrls:
+                continue
+            ok, note = ensure_specrules_cache(bool(self.args.skip_specrules_pull), url)
+            if not self.args.skip_specrules_pull:
+                self.pulledUrls.add(url)
+            if not ok:
+                self.pullFailures.append(RULES_ADVICE_PULL_FAILED.format(kind=kind, reason=note))
+
+    # -- 执行 ----------------------------------------------------------------
+
+    def legacy_mount(self) -> dict[str, Any]:
+        """2.45.0 原 resolve / mount（不变）。"""
+        specrules_dir = self.workspace / RULES_TREE_NAME
+        repo_url = self.resolution.repo_url or SPECRULES_REPO_URL
+        if self.args.specrules_mode == "submodule":
+            return setup_specrules_submodule(self.args, self.workspace, specrules_dir, repo_url=repo_url)
+        return setup_specrules_copy(self.args, self.workspace, specrules_dir, repo_url=repo_url)
+
+    def reconcile_legacy_fallback_advice(self, action: dict[str, Any]) -> None:
+        """G-10：隐式回落的 advice 在 legacy 挂载之前就声称「已挂上默认 Java 规则」。
+
+        默认源实际挂载失败（空缓存且不可达，exit 1、无树）时改成与结果一致的句子。
+        挂载成功时原句不动（树已在，之后不会自动重试隐式采用）。"""
+        if action.get("status") != "error":
+            return
+        detail = str(action.get("reason") or "legacy mount failed")
+        replacement = (
+            f"旧路径的默认 Java 规则也未能挂载（{detail}）。本次未挂载任何规则树。"
+            "网络或默认源恢复后再次 setup 会重试隐式采用；"
+            "或执行 specrules catalog configure --routing auto 后再 setup"
+        )
+        advice = self.decision.advice
+        for index, item in enumerate(advice):
+            if RULES_ADVICE_PULL_FAILED_MOUNTED in item:
+                advice[index] = item.replace(RULES_ADVICE_PULL_FAILED_MOUNTED, replacement)
+            elif RULES_ADVICE_IMPLICIT_LEGACY_MOUNTED in item:
+                advice[index] = item.replace(RULES_ADVICE_IMPLICIT_LEGACY_MOUNTED, replacement)
+
+    def run(self) -> dict[str, Any] | None:
+        decision = self.decision
+        if self.configError is not None:
+            self.engaged = True
+            self.error_code = self.configError.error_code
+            decision.advice.append("ruleSources.routing=auto 但规则路由配置非法：修正 .devkit/config.json 的 ruleSources 后再 setup")
+            return self._error_action(
+                f"invalid ruleSources config with routing=auto: {compact_error(self.configError)}; "
+                "specrules tree and binding receipt left unchanged"
+            )
+        if self.catalog is None or decision.mode == "disabled":
+            return None
+        result = self._route(decision)
+        self.engaged = result is not None or decision.mode == "adopted" or bool(self.pullFailures) or any(
+            item.startswith(("隐式采用", "已采用保持")) for item in decision.advice
+        )
+        return result
+
+    def _route(self, decision: RoutingDecision) -> dict[str, Any] | None:
+        if decision.mode == "legacy":
+            at_risk = self.selector.legacyTreeAtRisk(self.workspace, self.catalog, self.receipt)
+            if at_risk and decision.source == "project-config":
+                return self._explicit_legacy_fallback()
+            if at_risk and decision.source == "legacy-default":
+                decision.advice.append(RULES_ADVICE_NON_JAVA_GUARD)
+                return setup_action(
+                    "specrules",
+                    self.workspace / RULES_TREE_NAME,
+                    self.workspace,
+                    "skipped",
+                    "kept existing non-Java specrules tree (binding receipt missing); see rule_routing.advice",
+                )
+            return None
+        if decision.adoptedBy == "explicit":
+            return self._adopt()
+        try:
+            return self._adopt()
+        except Exception as error:  # noqa: BLE001 - implicit 永不 exit 1（codex P2-3）
+            return self._implicit_failure(f"规则路由异常：{compact_error(error)}")
+
+    def _explicit_legacy_fallback(self) -> dict[str, Any]:
+        """第 3 步显式 legacy 回退：真正回到 Java 源后才归档回执并写迁移回执；任一步失败恢复原状并报告未完成（exit 1）。
+
+        - copy 分发：现有树改名备份 → 原 resolve / mount → 校验回退后树不再声明非 Java kind → 写迁移回执 → 归档回执；
+        - submodule 分发（D-35 ②）：见 ``_submodule_legacy_fallback``；submodule 树上拒绝 ``--specrules-mode copy``。
+        """
+        tree = self.workspace / RULES_TREE_NAME
+        stamp = _rs_now_stamp()
+        recorded = None
+        if self.receipt is not None and self.receipt.readable:
+            recorded = self.receipt.moduleEntry(".") or (self.receipt.modules[0] if self.receipt.modules else None)
+        from_kind = (_rs_lenient_package_fields(tree / RULE_PACKAGE_ENTRY) or {}).get("kind")
+        if os.path.lexists(tree / ".git") or _specrules_gitmodules_registered(self.workspace):
+            return self._submodule_legacy_fallback(stamp, recorded, from_kind)
+        migrator = ManagedTreeMigrator(self.workspace, stamp=lambda: stamp)
+        existed = os.path.lexists(tree)
+        backup: Path | None = migrator.backup(tree, stamp) if existed else None
+
+        def revert() -> None:
+            if backup is not None:
+                migrator.restore(backup, tree)
+            elif not existed and tree.is_dir() and not tree.is_symlink():
+                shutil.rmtree(tree, ignore_errors=True)
+
+        try:
+            action = self.legacy_mount()
+        except Exception:
+            revert()
+            raise
+        if action["status"] == "error":
+            revert()
+            if backup is not None:
+                action["reason"] += "; explicit legacy fallback failed, the original specrules/ was restored"
+            self.error_code = _mount_failure_code(action["reason"])
+            action["error_code"] = self.error_code
+            return action
+        if RuleSourceSelector.isNonJavaTree(self.workspace):
+            revert()
+            return self._fallback_error(
+                f"{self.resolution.repo_url or SPECRULES_REPO_URL} still declares a non-Java rule package",
+                RULES_INCOMPATIBLE_SOURCE,
+            )
+        to_fields = _rs_lenient_package_fields(tree / RULE_PACKAGE_ENTRY) or {}
+        backup_rel = (_rule_rel(backup, self.workspace) + "/") if backup is not None else None
+        archived = self._finish_fallback(
+            stamp,
+            fromSource={
+                "kind": recorded.kind if recorded is not None else from_kind,
+                "repoUrl": recorded.repoUrl if recorded is not None else None,
+                "commit": recorded.commit if recorded is not None else None,
+            },
+            toSource={
+                "kind": to_fields.get("kind") or "java-backend",
+                "repoUrl": self.resolution.repo_url or SPECRULES_REPO_URL,
+                "commit": None,
+            },
+            backupPath=backup_rel,
+            revert=revert,
+        )
+        if isinstance(archived, dict):
+            return archived
+        notes = ["显式 legacy 回退完成"]
+        if backup_rel:
+            notes.append(f"原规则树已备份到 {backup_rel}")
+        if archived is not None:
+            notes.append(f"绑定回执已归档到 {_rule_rel(archived, self.workspace)}")
+        notes.append("改回 --routing auto 后 setup 可重新采用")
+        self.decision.advice.append("；".join(notes))
+        return action
+
+    def _finish_fallback(
+        self, stamp: str, *, fromSource: dict[str, Any], toSource: dict[str, Any], backupPath: str | None, revert: Any
+    ) -> Path | None | dict[str, Any]:
+        """回退收尾：先写迁移回执再归档绑定回执；任一步 IO 失败 → 删除本次迁移回执、恢复原树（回执仍在原位），
+        返回 error action（下次 setup 从原状态重来，不会把 Java 树再备份一次，arch P2-5）。"""
+        written: Path | None = None
+        try:
+            written = MigrationReceipt(
+                fromSource=fromSource, toSource=toSource, result="applied", backupPath=backupPath, at=_rs_now_iso()
+            ).write(self.workspace, stamp)
+            archived = ManagedTreeMigrator(self.workspace).archiveReceipt(self.workspace, stamp)
+            self.fallbackMigrationPath = written
+            return archived
+        except OSError as error:
+            if written is not None:
+                try:
+                    written.unlink()
+                except OSError:
+                    pass
+            problems = revert() or []
+            return self._fallback_error(f"cannot record the fallback ({error})", RULES_INCOMPLETE_SOURCE, problems=problems)
+
+    def _fallback_error(self, detail: str, code: str, *, problems: list[str] | None = None) -> dict[str, Any]:
+        """回退未完成。``problems`` 非空（恢复本身失败的双重故障）时如实写明恢复不完整与处理建议，不再声称原状未改动。"""
+        self.error_code = code
+        if problems:
+            self.decision.advice.append(
+                f"显式 legacy 回退未完成，且恢复原状不完整（{'; '.join(problems)}）：规则树 / .gitmodules / 子模块登记可能处于中间状态。"
+                "请先用 git status 与 git diff --cached -- .gitmodules specrules 核对，必要时 git checkout -- .gitmodules、"
+                "git submodule sync specrules && git submodule update --init specrules 回到已提交状态；"
+                "绑定回执仍在原位（.devkit/specrules-binding.json），修复后再 setup，或改回 specrules catalog configure --routing auto"
+            )
+            return self._error_action(
+                f"explicit legacy fallback not completed: {detail}; restore incomplete ({'; '.join(problems)})"
+            )
+        self.decision.advice.append(
+            "显式 legacy 回退未完成：原规则树与绑定回执未改动；修复后再 setup，或改回 specrules catalog configure --routing auto"
+        )
+        return self._error_action(f"explicit legacy fallback not completed: {detail}; original specrules/ and binding receipt restored")
+
+    def _submodule_legacy_fallback(self, stamp: str, recorded: RuleBinding | None, from_kind: str | None) -> dict[str, Any]:
+        """D-35 ②：备份原 gitlink 与子模块 URL → 既有 submodule 切换逻辑切到 Java 源 → gitlink 仍钉在原提交时取 Java 源
+        远端 HEAD 并检出、``git add`` 暂存新 gitlink（不代 commit）→ 校验回退后树为 java-backend → 写迁移回执、归档回执。
+        任一步失败恢复原 gitlink / URL / ``.gitmodules`` 并报告未完成（exit 1）。"""
+        tree = self.workspace / RULES_TREE_NAME
+        if self.args.specrules_mode != "submodule":
+            self.error_code = RULES_MIGRATION_CONFLICT
+            self.decision.advice.append("specrules/ 是 git submodule：去掉 --specrules-mode copy 重跑 setup 回退到 Java 源，或先移除 submodule 再 setup")
+            return self._error_action(RULES_FALLBACK_COPY_ON_SUBMODULE)
+        snapshot = _SubmoduleSnapshot.capture(self.workspace)
+        if snapshot is None:
+            return self._fallback_error("git is unavailable or the workspace is not a git repository", RULES_INCOMPLETE_SOURCE)
+        git = snapshot.git
+        old_url = _gitmodules_specrules_url(self.workspace)
+        old_link = snapshot.gitlink or snapshot.head
+        if os.path.lexists(tree / ".git") and _specrules_working_tree_dirty(git, tree):
+            return self._fallback_error("specrules submodule has local changes; commit or discard them first", RULES_MIGRATION_CONFLICT)
+        # Claude R2-P2-c：回退要 git add .gitmodules；它若已有本次之外的未暂存修改，add 会把用户改动一并暂存——
+        # 失败关闭（与子模块脏同口径），不产生半暂存状态，由用户先处理再重跑
+        unstaged = run_external([git, "-C", str(self.workspace), "diff", "--quiet", "--", ".gitmodules"], check=False)
+        if unstaged.returncode != 0:
+            self.error_code = RULES_MIGRATION_CONFLICT
+            self.decision.advice.append(
+                ".gitmodules 有未暂存的修改：回退需要 git add .gitmodules，会把这些修改一并暂存，已拒绝且未改动任何文件。"
+                "先 git add .gitmodules（保留）或 git checkout -- .gitmodules（放弃）后再 setup"
+            )
+            return self._error_action(
+                f"{RULES_MIGRATION_CONFLICT}: .gitmodules has unstaged changes; explicit legacy fallback would stage them "
+                "together with the submodule URL switch — stage or discard them first, then re-run setup"
+            )
+
+        def revert() -> list[str]:
+            return snapshot.restore()
+
+        def failed(detail: str, code: str) -> dict[str, Any]:
+            return self._fallback_error(detail, code, problems=revert())
+
+        url = self.resolution.repo_url or SPECRULES_REPO_URL
+        try:
+            action = self.legacy_mount()  # 既有切换：URL 不同 → dirty 检查 + set-url + sync + update --init
+            if action["status"] == "error":
+                return failed(action["reason"], _mount_failure_code(action["reason"]))
+            if RuleSourceSelector.isNonJavaTree(self.workspace):
+                # gitlink 仍钉在原（非 Java）提交：取 Java 源远端 HEAD 检出
+                fetch = run_external([git, "-C", str(tree), "fetch", "-q", "origin", "HEAD"], check=False)
+                if fetch.returncode != 0:
+                    return failed(f"git fetch of {url} failed: {_git_result_diagnostic(fetch, limit=200)}", RULES_INCOMPLETE_SOURCE)
+                checkout = run_external([git, "-C", str(tree), "checkout", "-q", "--detach", "FETCH_HEAD"], check=False)
+                if checkout.returncode != 0:
+                    return failed(f"checkout of {url} HEAD failed: {_git_result_diagnostic(checkout, limit=200)}", RULES_INCOMPLETE_SOURCE)
+            status, meta, advice = _rs_validate_source(tree, "java-backend", explicit=True)
+            if status != "bound" or meta is None:
+                return failed(
+                    f"{url} is not a usable java-backend rule package ({status}: {'; '.join(advice) or 'validation failed'})",
+                    RULES_STATUS_ERROR_CODES.get(status, RULES_INCOMPATIBLE_SOURCE),
+                )
+            staged = run_external([git, "-C", str(self.workspace), "add", "--", ".gitmodules", RULES_TREE_NAME], check=False)
+            if staged.returncode != 0:
+                return failed(f"git add of the new gitlink failed: {_git_result_diagnostic(staged, limit=200)}", RULES_INCOMPLETE_SOURCE)
+            new_link = _specrules_git_sha(git, tree)
+        except Exception:
+            # Claude R2-P2-a：与 copy 分发一致——原语 / 检出中的异常（如切源时 copytree / rename 的 OSError）先恢复快照再上抛
+            snapshot.restore()
+            raise
+        archived = self._finish_fallback(
+            stamp,
+            fromSource={
+                "kind": recorded.kind if recorded is not None else from_kind,
+                "repoUrl": (recorded.repoUrl if recorded is not None else None) or old_url or None,
+                "commit": old_link or (recorded.commit if recorded is not None else None),
+            },
+            toSource={"kind": meta.kind, "repoUrl": url, "commit": new_link},
+            backupPath=None,
+            revert=revert,
+        )
+        if isinstance(archived, dict):
+            return archived
+        moved = f"gitlink {(old_link or '-')[:12]} → {(new_link or '-')[:12]}"
+        notes = [
+            "显式 legacy 回退完成",
+            f"specrules submodule 已切回 {url}（{moved}，已 git add，请自行提交 .gitmodules 与 specrules）",
+            # S-1：可直接复制的提交命令
+            'git commit -m "specrules: back to Java rules" -- .gitmodules specrules',
+            # S-2：放弃暂存时 git reset 不会改 .git/config 与子模块 origin，需要 sync
+            "如放弃此次回退：git reset -q -- .gitmodules specrules && git checkout -- .gitmodules 后执行 "
+            "git submodule sync specrules && git submodule update --init specrules",
+        ]
+        if archived is not None:
+            notes.append(f"绑定回执已归档到 {_rule_rel(archived, self.workspace)}（放弃回退时一并移回 .devkit/specrules-binding.json）")
+        if self.fallbackMigrationPath is not None:
+            # S-3：放弃回退后 result=applied 的迁移回执与实际状态不符——提示一并删除，避免审计记录残留
+            notes.append(
+                f"迁移回执 {_rule_rel(self.fallbackMigrationPath, self.workspace)}（result=applied）记录了本次回退，"
+                "放弃回退时一并删除该文件"
+            )
+        notes.append("改回 --routing auto 后 setup 可重新采用")
+        self.decision.advice.append("；".join(notes))
+        action = dict(action)
+        action["status"] = "updated"
+        action["reason"] = f"{action['reason']}; switched specrules submodule back to the Java source ({moved}, staged)"
+        return action
+
+    def _adopt(self) -> dict[str, Any] | None:
+        decision, profile = self.decision, self.profile
+        explicit = decision.adoptedBy == "explicit"
+        if explicit and (profile is None or profile.status != "confirmed"):
+            # D-23 ①：挂载前门槛——不挂载、不改现有树、不写也不更新回执
+            self.bindings = self.selector.explicitGateBindings(profile) if profile is not None else []
+            self.error_code = RULES_BINDING_MISMATCH
+            state = profile.status if profile is not None else f"detection failed ({self.detectionError})"
+            for binding in self.bindings[:1]:
+                decision.advice.extend(binding.advice)
+            if profile is None:
+                decision.advice.append("routing=auto 要求画像 confirmed；或执行 specrules catalog configure --routing legacy 后 setup")
+            return self._error_action(
+                f"{RULES_BINDING_MISMATCH}: routing=auto requires a confirmed project profile (got {state}); "
+                "specrules tree and binding receipt left unchanged"
+            )
+        if profile is None:
+            return self._implicit_failure(f"项目识别失败：{self.detectionError}")
+        bindings = self._select_with_pull(profile)
+        failing = [item for item in bindings if item.bindingStatus not in RULES_OK_STATUSES]
+        if failing:
+            first = failing[0]
+            reason = f"模块 {first.module} 选源为 {first.bindingStatus}" + (f"：{first.advice[-1]}" if first.advice else "")
+            if explicit:
+                self.bindings = bindings
+                self.error_code = RULES_STATUS_ERROR_CODES.get(first.bindingStatus, RULES_BINDING_MISMATCH)
+                decision.advice.append(reason)
+                return self._error_action(f"{self.error_code}: {reason}; specrules tree left unchanged")
+            return self._implicit_failure(reason)
+        return self._mount_all(profile, bindings)
+
+    def _select_with_pull(self, profile: ProjectProfile) -> list[RuleBinding]:
+        """先按现有缓存选源得出各模块 URL，拉取（同一次 setup 每个 URL 至多一次），再在更新后的缓存上重新选源。"""
+        catalog = self.catalog
+        assert catalog is not None
+        first = self.selector.select(profile, catalog, catalog.sourceDirs())
+        for binding in first:
+            url = binding.repoUrl
+            if url is None or binding.bindingStatus in ("unbound-no-kind", "binding-mismatch", "missing-source"):
+                continue
+            if url in self.pulledUrls:
+                continue
+            ensure_specrules_cache(bool(self.args.skip_specrules_pull), url)
+            if not self.args.skip_specrules_pull:
+                self.pulledUrls.add(url)
+        return self.selector.select(profile, catalog, catalog.sourceDirs())
+
+    def _distribution(self, binding: RuleBinding, mount: str) -> str:
+        if mount != RULES_TREE_NAME:
+            return "copy"  # 按模块挂载点只支持 copy（submodule 原语只管理根 specrules/）
+        tree = self.workspace / mount
+        if os.path.lexists(tree / ".git") or _specrules_gitmodules_registered(self.workspace):
+            return "submodule"
+        if os.path.lexists(tree):
+            return "copy"  # 保持现有普通目录的分发方式，不在采用时顺带转换为 submodule
+        previous = self.receipt.moduleEntry(binding.module) if self.receipt is not None and self.receipt.readable else None
+        if previous is not None and previous.distribution in ("copy", "submodule"):
+            return previous.distribution
+        return "submodule" if self.args.specrules_mode == "submodule" else "copy"
+
+    def _mount_all(self, profile: ProjectProfile, bindings: list[RuleBinding]) -> dict[str, Any] | None:
+        decision = self.decision
+        mixed = profile.classification == "mixed"
+        bound = [item for item in bindings if item.bindingStatus == "bound"]
+        groups: list[tuple[RuleBinding, list[RuleBinding]]] = []
+        if mixed:
+            # 每个模块是独立挂载点：回执只记 target 一条，受管清单用挂载结果的完整文件
+            # （与单模块根条目同一口径，D-31 ④ 的「模块条目只记入口」只适用于非 mixed）。
+            # members 不得再放入 target。同一对象会进回执两次，下面的入口覆盖还会把
+            # RuleMountExecutor 填好的完整清单收成只剩 rules/index.md，第二次 setup 将其余文件判为 unknown-owner（G-8）。
+            groups = [(item, []) for item in bound]
+        elif bound:
+            root = next((item for item in bound if item.module == "."), None)
+            if root is None:
+                template = bound[0]
+                root = RuleBinding(
+                    module=".",
+                    kind=template.kind,
+                    repoUrl=template.repoUrl,
+                    bindingStatus="bound",
+                    packageVersion=template.packageVersion,
+                    protocol=template.protocol,
+                    entry=f"{RULES_TREE_NAME}/{RULE_PACKAGE_ENTRY}",
+                )
+            groups = [(root, [item for item in bound if item is not root])]
+        migrator = ManagedTreeMigrator(self.workspace)
+        receipt_modules: list[RuleBinding] = []
+        plans: list[tuple[RuleBinding, list[RuleBinding], MigrationPlan, str]] = []
+        legacy_dir = specrules_cache_dir(self.resolution.repo_url or SPECRULES_REPO_URL)
+        usable_receipt = self.receipt if self.receipt is not None and self.receipt.readable else None
+        for target, members in groups:
+            mount = _rule_mount_rel(target)
+            target.distribution = self._distribution(target, mount)
+            plan = migrator.plan(
+                self.workspace,
+                usable_receipt,
+                target,
+                legacySourceDir=legacy_dir if usable_receipt is None and legacy_dir.is_dir() else None,
+            )
+            plans.append((target, members, plan, mount))
+            receipt_modules.append(target)
+            receipt_modules.extend(members)
+        receipt = BindingReceipt(
+            schemaVersion=RULE_BINDING_SCHEMA_VERSION,
+            routingMode="adopted",
+            adoptedBy=decision.adoptedBy or "implicit",
+            profileFingerprint=profile.fingerprint,
+            boundAt=_rs_now_iso(),
+            modules=receipt_modules,
+        )
+        conflicted = [(target, plan) for target, _, plan, _ in plans if plan.conflicts]
+        if conflicted:
+            target, plan = conflicted[0]
+            listing = ", ".join(f"{item.path} ({item.reason})" for item in plan.conflicts[:5])
+            more = f" (+{len(plan.conflicts) - 5} more)" if len(plan.conflicts) > 5 else ""
+            hint = (
+                "受管树被删除：恢复 {mount}/，或确认后删除 .devkit/specrules-binding.json 再 setup 重挂".format(
+                    mount=plan.mountPoint
+                )
+                if plan.treeDeleted
+                else "规则树中有改动的受管文件或未知归属文件：处理后再 setup"
+            )
+            reason = f"{RULES_MIGRATION_CONFLICT}: {listing}{more}; {hint}"
+            if decision.adoptedBy == "explicit":
+                try:
+                    migrator.recordNotApplied(plan, receipt)  # 只写 result=not-applied 的迁移回执，不动树（codex P2-7）
+                except OSError as error:
+                    decision.advice.append(f"迁移回执写入失败：{error}")
+                self.bindings = bindings
+                self.error_code = RULES_MIGRATION_CONFLICT
+                decision.advice.append(hint)
+                return self._error_action(reason)
+            return self._implicit_failure(reason)
+        previous_receipt = self._receipt_bytes()
+        residue = _DevkitResidue(self.workspace)
+        executor = RuleMountExecutor(self.args, self.workspace, migrator)
+        completed: list[tuple[str, Path | None, bool, Path | None]] = []
+        undo_submodule: Any = None
+        actions: list[dict[str, Any]] = []
+        # submodule（只可能是根挂载点）放最后：copy 挂载失败时仍可按备份整体回滚
+        ordered = sorted(plans, key=lambda item: item[0].distribution == "submodule")
+        try:
+            for target, members, plan, mount in ordered:
+                skip = bool(self.args.skip_specrules_pull) or (target.repoUrl or SPECRULES_REPO_URL) in self.pulledUrls
+                existed = os.path.lexists(self.workspace / mount)
+                action = executor.mount(target, plan, mount, skip, receipt)
+                if executor.lastChanged and target.distribution != "submodule":
+                    completed.append((mount, executor.lastBackup, existed, executor.lastMigrationPath))
+                if executor.lastUndo is not None:
+                    undo_submodule = executor.lastUndo
+                actions.append(action)
+                entry_rel = f"{mount}/{RULE_PACKAGE_ENTRY}"
+                entry_file = self.workspace / entry_rel
+                # 非 mixed 的模块条目共享根挂载点，只记录入口（D-31 ④）。
+                # target 自己的完整清单由 RuleMountExecutor / commit 写入，这里不得覆盖。
+                for member in members:
+                    if member is target:
+                        continue
+                    member.commit, member.packageVersion, member.protocol = target.commit, target.packageVersion, target.protocol
+                    member.distribution, member.offline, member.repoUrl = target.distribution, target.offline, target.repoUrl
+                    member.managedFiles = [ManagedFile(entry_rel, sha256_file(entry_file))] if entry_file.is_file() else []
+            # 绑定回执唯一写点（copy 的 commit 事务内也会写一次）：内容（忽略 boundAt）不变不重写，重复 setup 幂等
+            if not _receipt_equivalent(previous_receipt, receipt):
+                receipt.write(self.workspace)
+        except Exception as error:  # noqa: BLE001 - 任何挂载期异常都先回滚；implicit 永不 exit 1（codex P2-3）
+            failure = error if isinstance(error, RuleMountFailure) else RuleMountFailure(
+                f"{type(error).__name__}: {compact_error(error)}"
+            )
+            # R2-P2-b：执行方内部撤销（submodule 快照恢复）的未完成项结构化上传，与外层回滚的问题合并
+            outer = self._rollback(completed, previous_receipt, undo_submodule)
+            problems = [*failure.rollback_problems, *outer]
+            if decision.adoptedBy == "explicit":
+                self.bindings = bindings
+                known = set(RULES_STATUS_ERROR_CODES.values()) | {RULES_MIGRATION_CONFLICT}
+                self.error_code = failure.error_code if failure.error_code in known else _mount_failure_code(str(failure))
+                decision.advice.append(f"挂载失败：{failure}")
+                if problems:
+                    decision.advice.append(_rollback_incomplete_hint(problems))
+                if not problems:
+                    left = "; specrules tree left unchanged"
+                elif outer:
+                    left = f"; rollback incomplete: {'; '.join(outer)}"
+                else:
+                    left = ""  # 内部撤销未完成已写在 failure 文案中（rollback incomplete (...)），不再声称原树未改动
+                return self._error_action(f"rule mount failed: {failure}{left}")
+            if decision.source == "implicit" and not problems:
+                # 首次采用回落：不留痕，与 2.45.0 工作区一致（codex P2-5）。回滚不完整时保留迁移回执作为核对线索
+                residue.clean()
+            return self._implicit_failure(f"挂载失败：{failure}", mount_failed=True, rollback_problems=problems)
+        self.bindings = bindings
+        for item in bindings:
+            if item.bindingStatus == "unbound-no-kind":
+                item.advice = [RULES_ADVICE_NO_KIND]
+        if not actions:
+            return setup_action(
+                "specrules",
+                self.workspace / RULES_TREE_NAME,
+                self.workspace,
+                "skipped",
+                "no module has a dedicated rule source (unbound-no-kind); no rule package mounted, binding receipt written",
+            )
+        if len(actions) == 1:
+            return actions[0]
+        merged = dict(actions[0])
+        merged["reason"] = "; ".join(f"{item['path']}: {item['reason']}" for item in actions)
+        statuses = {item["status"] for item in actions}
+        if statuses == {"created"}:
+            merged["status"] = "created"
+        elif statuses == {"skipped"}:
+            merged["status"] = "skipped"  # mixed 多挂载点全部 no-op 时仍是 skipped（D-32 ①）
+        else:
+            merged["status"] = "updated"
+        return merged
+
+    def _receipt_bytes(self) -> bytes | None:
+        path = BindingReceipt.pathFor(self.workspace)
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError:
+            return None
+
+    def _rollback(
+        self,
+        completed: list[tuple[str, Path | None, bool, Path | None]],
+        previous: bytes | None,
+        undo_submodule: Any = None,
+    ) -> list[str]:
+        """挂载中途失败：撤销 submodule 挂载（快照恢复），已完成的 copy 挂载按其备份还原（原本无树则移除新树），
+        其 applied 迁移回执改写为 rolled-back（arch P2-9），回执恢复原字节。返回未能恢复的步骤。"""
+        problems: list[str] = []
+        if undo_submodule is not None:
+            try:
+                problems.extend(undo_submodule() or [])
+            except Exception as error:  # noqa: BLE001 - 回滚尽力而为，问题如实报告
+                problems.append(f"submodule: {compact_error(error)}")
+        for mount, backup, existed, migration in reversed(completed):
+            tree = self.workspace / mount
+            try:
+                if backup is not None and backup.is_dir():
+                    ManagedTreeMigrator(self.workspace).restore(backup, tree)
+                elif not existed and tree.is_dir() and not tree.is_symlink():
+                    shutil.rmtree(tree, ignore_errors=True)
+            except (OSError, DevkitFlowError) as error:
+                problems.append(f"{mount}: {compact_error(error)}")
+            if migration is not None and migration.is_file():
+                try:
+                    record = json.loads(migration.read_text(encoding="utf-8"))
+                    record["result"] = "rolled-back"
+                    record["backupPath"] = None
+                    record["at"] = _rs_now_iso()
+                    atomic_write_text(migration, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+                except (OSError, ValueError, UnicodeDecodeError):
+                    pass  # 审计记录改写失败不掩盖原始错误
+        path = BindingReceipt.pathFor(self.workspace)
+        try:
+            if previous is not None:
+                atomic_write_text(path, previous.decode("utf-8"))
+            elif os.path.lexists(path):
+                path.unlink()
+        except (OSError, UnicodeDecodeError) as error:
+            problems.append(f"binding receipt: {error}")
+        return problems
+
+    def _implicit_failure(
+        self, reason: str, *, mount_failed: bool = False, rollback_problems: list[str] | None = None
+    ) -> dict[str, Any] | None:
+        """implicit 永不 exit 1：首次采用回落 legacy 原挂载；已采用保持则原树不动、不更新回执，绑定按回执与现有树。
+
+        ``rollback_problems`` 非空（挂载失败后回滚本身也失败的双重故障，Claude R2-P2-b）时，advice 如实写明回滚不完整
+        与恢复建议，不再声称「原规则树与绑定回执未改动」/「与 2.45.0 一致」。"""
+        decision = self.decision
+        incomplete = _rollback_incomplete_hint(rollback_problems) if rollback_problems else ""
+        if decision.source == "implicit":
+            prefix = "隐式采用挂载失败" if mount_failed else "隐式采用未完成"
+            decision.mode, decision.adoptedBy, decision.source = "legacy", None, "legacy-default"
+            if incomplete:
+                # R2-P2-b：回滚不完整时规则树 / 子模块可能残留半挂载状态——不在其上叠加旧路径挂载（会把残留判为 dirty
+                # 而 exit 1，或覆盖残留造成二次改动）；本次跳过 specrules 挂载，exit 0，按 advice 恢复后再 setup
+                decision.advice.append(f"{prefix}：{reason}；{incomplete}；本次未按旧路径挂载，恢复后再 setup")
+                return setup_action(
+                    "specrules",
+                    self.workspace / RULES_TREE_NAME,
+                    self.workspace,
+                    "skipped",
+                    "implicit rule mount failed and its rollback was incomplete; legacy mount not attempted on the "
+                    "partially restored tree; see rule_routing.advice",
+                )
+            decision.advice.append(f"{prefix}：{reason}；{RULES_ADVICE_IMPLICIT_LEGACY_MOUNTED}")
+            return None
+        if incomplete:
+            decision.advice.append(
+                f"已采用保持：{reason}；{incomplete}，再 setup（或 specrules catalog configure --routing legacy 后 setup）"
+            )
+        else:
+            decision.advice.append(
+                f"已采用保持：{reason}；原规则树与绑定回执未改动（修复源后再 setup，或 specrules catalog configure --routing legacy 后 setup）"
+            )
+        self.bindings = self._hold_preview()
+        return setup_action(
+            "specrules",
+            self.workspace / RULES_TREE_NAME,
+            self.workspace,
+            "skipped",
+            "rule mount failed and its rollback was incomplete; see rule_routing.advice"
+            if incomplete
+            else "kept the adopted rule tree and binding receipt unchanged; see rule_routing.advice",
+        )
+
+    def _hold_preview(self) -> list[RuleBinding]:
+        profile, catalog, receipt = self.profile, self.catalog, self.receipt
+        if profile is None or catalog is None or receipt is None:
+            return []
+        try:
+            selected = self.selector.select(profile, catalog, catalog.sourceDirs())
+            held = hold_bindings(self.workspace, selected, receipt, profile)
+            context = RuleClosureResolver(self.workspace).resolve(self.decision, held, profile)
+            return [item.binding for item in context.modules]
+        except Exception as error:  # noqa: BLE001 - 预览只诊断
+            self.decision.advice.append(f"绑定预览失败：{compact_error(error)}")
+            return []
+
+    def _error_action(self, reason: str) -> dict[str, Any]:
+        action = setup_action("specrules", self.workspace / RULES_TREE_NAME, self.workspace, "error", reason)
+        if self.error_code:
+            action["error_code"] = self.error_code
+        return action
+
+    # -- 输出 ----------------------------------------------------------------
+
+    def message_lines(self) -> list[str]:
+        """文本输出的路由摘要：只在路由实际介入（adopted、显式回退、非 Java 树守卫、隐式采用回落）时追加，
+        2.45.0 工作区（legacy-default 且未介入）的 message 与原输出逐字一致。"""
+        if not self.engaged:
+            return []
+        decision = self.decision
+        adopted = f", {decision.adoptedBy}" if decision.adoptedBy else ""
+        lines = [f"- rule-routing: {decision.mode} ({decision.source}{adopted})"]
+        lines.extend(f"  advice: {item}" for item in self.routing_json()["advice"])
+        return lines
+
+    def detection_json(self) -> dict[str, Any] | None:
+        profile = self.profile
+        if profile is None:
+            return None
+        return {
+            "classification": profile.classification,
+            "status": profile.status,
+            "modules": [{"id": module.id, "classification": module.classification} for module in profile.modules],
+            "fingerprint": profile.fingerprint,
+        }
+
+    def routing_json(self) -> dict[str, Any]:
+        decision = self.decision
+        bindings = self.bindings
+        if not bindings and self.profile is not None and decision.mode in ("legacy", "disabled"):
+            status = "disabled" if decision.mode == "disabled" else "legacy-diagnostic"
+            bindings = [RuleBinding(module=module.id, kind=None, bindingStatus=status) for module in self.profile.modules]
+        advice: list[str] = []
+        unbound = [f"模块 {item.module}：{RULES_ADVICE_NO_KIND}" for item in bindings if item.bindingStatus == "unbound-no-kind"]
+        for item in [*self.advice, *decision.advice, *unbound]:
+            if item not in advice:
+                advice.append(item)
+        return {
+            "mode": decision.mode,
+            "routing_source": decision.source,
+            "adoptedBy": decision.adoptedBy,
+            "bindings": [
+                {"module": item.module, "kind": item.kind, "repoUrl": item.repoUrl, "status": item.bindingStatus}
+                for item in bindings
+            ],
+            "advice": advice,
+        }
+
+
 def command_setup(args: argparse.Namespace) -> int:
     workspace = Path(args.target).expanduser().resolve()
     if workspace.exists() and not workspace.is_dir():
@@ -1082,8 +2489,12 @@ def command_setup(args: argparse.Namespace) -> int:
 
     # 2. specrules/：先 resolve 生效态。invalid 拒绝挂载且不按关闭清理；
     #    disabled 走 skip-remove；开启路径按 Resolution.repo_url 挂载。
+    #    016 T-05：resolve 之后做规则源路由判定（只读识别 + 六步判定）；legacy / disabled 走原路径不变，
+    #    adopted 由 SetupRuleRouting 选源、冲突检查、RuleMountExecutor 挂载并写绑定回执。
     specrules_dir = workspace / "specrules"
     specrules_resolution = resolve_specrules(workspace)
+    rule_routing = SetupRuleRouting(args, workspace, specrules_resolution)
+    rule_routing.prepare()
     if specrules_resolution.effective_state == "invalid":
         actions.append(
             setup_action(
@@ -1097,11 +2508,11 @@ def command_setup(args: argparse.Namespace) -> int:
     elif specrules_resolution.effective_state == "disabled":
         actions.append(cleanup_specrules_tree(workspace, specrules_resolution))
     else:
-        repo_url = specrules_resolution.repo_url or SPECRULES_REPO_URL
-        if args.specrules_mode == "submodule":
-            actions.append(setup_specrules_submodule(args, workspace, specrules_dir, repo_url=repo_url))
-        else:
-            actions.append(setup_specrules_copy(args, workspace, specrules_dir, repo_url=repo_url))
+        routed = rule_routing.run()
+        if routed is None:
+            routed = rule_routing.legacy_mount()
+            rule_routing.reconcile_legacy_fallback_advice(routed)
+        actions.append(routed)
 
     # 3. AGENTS.md / CLAUDE.md：仅当不存在时写入极简路由版，已存在绝不覆盖
     for name in ("AGENTS.md", "CLAUDE.md"):
@@ -1178,15 +2589,19 @@ def command_setup(args: argparse.Namespace) -> int:
     summary = ", ".join(f"{status}: {counts[status]}" for status in sorted(counts))
     lines = [f"setup {'completed with errors' if failed else 'completed'} ({summary})"]
     lines.extend(f"- {item['item']}: {item['status']} — {item['reason']}" for item in actions)
-    emit(
-        {
-            "status": "issues" if failed else "ok",
-            "message": "\n".join(lines),
-            "target": str(workspace),
-            "actions": actions,
-        },
-        args.format,
-    )
+    lines.extend(rule_routing.message_lines())
+    payload: dict[str, Any] = {
+        "status": "issues" if failed else "ok",
+        "message": "\n".join(lines),
+        "target": str(workspace),
+        "actions": actions,
+        # 016 T-05：新增诊断键（legacy / disabled 下只加键，既有键与退出码不变）
+        "project_detection": rule_routing.detection_json(),
+        "rule_routing": rule_routing.routing_json(),
+    }
+    if rule_routing.error_code:
+        payload["error_code"] = rule_routing.error_code
+    emit(payload, args.format)
     return 1 if failed else 0
 
 
@@ -1456,7 +2871,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     global_cli = find_global_cli()
     if global_cli is not None:
         global_version = extract_embedded_version(global_cli)
-        matches = sha256_file(global_cli) == sha256_file(current_cli_path())
+        matches = sha256_file(cli_code_path(global_cli)) == sha256_file(current_cli_path())
         add(
             "global-cli",
             "ok",
@@ -1689,6 +3104,30 @@ def command_doctor(args: argparse.Namespace) -> int:
         third_party_count=stop_scan.third_party_count,
         file_modified=stop_scan.file_modified,
     )
+
+    def add_readonly(name: str, builder: Any) -> None:
+        try:
+            result = builder()
+        except Exception as error:
+            add(name, "warn", f"{name} failed: {type(error).__name__}", detail={})
+            return
+        detail = result.get("detail")
+        if not isinstance(detail, dict):
+            detail = {}
+        add(
+            name,
+            str(result.get("status") or "warn"),
+            str(result.get("message") or ""),
+            fix=str(result.get("fix") or ""),
+            detail=detail,
+        )
+
+    # D-73 ①：只识别一次，两项检查共用同一份内存画像（各自识别会各自重置预算，且可能得到不同结果）。
+    detection = doctor_detect_project(workspace)
+    add_readonly("project-detection", lambda: doctor_project_detection(workspace, detection))
+    add_readonly("rule-binding", lambda: doctor_rule_binding(workspace, detection))
+    add_readonly("runtime-lifecycle-transactions", doctor_runtime_transactions)
+    add_readonly("version-provenance", lambda: doctor_version_provenance(workspace))
 
     rank = {"ok": 0, "warn": 1, "error": 2}
     worst = max((rank[check["status"]] for check in checks), default=0)

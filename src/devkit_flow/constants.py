@@ -168,6 +168,9 @@ CLEAR_ONLY_GLOBAL = "--clear is only valid with --scope global"
 HTML_UI_HELP = "Configure HTML clarification form and design-doc preview; default off."
 
 
+PROGRESS_BAR_HELP = "Configure or query the Claude Code progress bar (AbovePrompt line); default on."
+
+
 SPEC_ARTIFACTS_HELP = (
     "Configure whether the current feature spec/{NNN}-* directory is included in git add/PR; default on."
 )
@@ -185,6 +188,15 @@ REVIEW_ROUNDS_HELP = (
 
 
 HTML_UI_INVALID_LAYER = "Invalid htmlUi"
+
+
+PROGRESS_BAR_INVALID_LAYER = "Invalid progressBar"
+
+
+# status JSON `tasks` 字段（spec/017-devkit-progress-mod 设计 §4.3.4，D-9、D-12 J11）
+TASK_CLOSED_STATES = {"已完成", "done", "completed", "取消"}
+TASK_ITEMS_LIMIT = 200
+TASK_DESC_MAX_CHARS = 60
 
 
 REVIEW_ROUNDS_INVALID_LAYER = "Invalid reviewRounds"
@@ -457,6 +469,10 @@ SPECRULES_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "devkit-specrules"
 SPECRULES_CUSTOM_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "specrules-cache"
 
 
+# 项目画像缓存目录（feature 016 设计 §4.7.1.2 / 接口 §8.2）：~/.devkit/cache/project-profiles/<sha256(realpath)[:16]>.json
+PROJECT_PROFILE_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "cache" / "project-profiles"
+
+
 SPECRULES_ILLEGAL_REASON = "disabled with project repoUrl"
 
 
@@ -719,18 +735,18 @@ PIPELINE_MODE_ROWS: dict[str, list[list[str]]] = {
     "传统": [
         ["S5.1", "实现代码", "dev-task-executor-agent", "S5", "pending", "[传统]"],
         ["S5.1-F", "资金安全风险分析", "fund-security-analyzer", "S5.1", "pending", "[传统] 风险关闭后才能进入单元测试/Review"],
-        ["S5.2", "单元测试", "unit-test-agent", "S5.1-F", "pending", "[传统] ≥80% 覆盖率"],
+        ["S5.2", "单元测试", "unit-test-agent", "S5.1-F", "pending", "[传统] 覆盖率按生效规则阈值（Java 默认 80%）"],
         ["S5.3", "架构审查", "architecture-reviewer-agent", "S5.2", "pending", "[传统]"],
         ["S5-R", "受影响模块全量回归", "feature-dev-manager-agent", "S5,S5.3", "pending", "不带测试选择器，Small 不得豁免"],
         ["S5-E2E", "需求准出 e2e 门", "feature-dev-manager-agent", "S5-R", "pending", "devkit 只读 quality-gate.json 判门；无跨进程面须 skipped + 书面理由"],
         ["S5.7", "Feature 级综合审查", "architecture-reviewer-agent", "S5-E2E", "pending", "单位=feature 而非任务；跨切片一致性 + 整体性判断"],
     ],
     "TDD": [
-        ["S5.1", "Red Phase（测试先行）", "tdd-test-agent", "S5", "pending", "[TDD] 编写失败测试 + 骨架类，等待用户确认"],
+        ["S5.1", "Red Phase（测试先行）", "tdd-test-agent", "S5", "pending", "[TDD] 编写失败测试 + 骨架类；已授权范围内自动推进；用户停止 / 必要输入缺失 / 适用人工 Gate 时暂停"],
         ["S5.2", "实现代码", "dev-task-executor-agent", "S5.1", "pending", "[TDD] 使测试通过"],
         ["S5.2-F", "资金安全风险分析", "fund-security-analyzer", "S5.2", "pending", "[TDD] 风险关闭后才能进入 Green/Review"],
-        ["S5.3", "Green Phase（验证通过）", "tdd-test-agent", "S5.2-F", "pending", "[TDD] 运行测试确认全绿，等待用户确认"],
-        ["S5.4", "Coverage Analysis（覆盖率）", "tdd-test-agent", "S5.3", "pending", "[TDD] ≥80%，不足则补测试"],
+        ["S5.3", "Green Phase（验证通过）", "tdd-test-agent", "S5.2-F", "pending", "[TDD] 运行测试确认全绿；已授权范围内自动推进；用户停止 / 必要输入缺失 / 适用人工 Gate 时暂停"],
+        ["S5.4", "Coverage Analysis（覆盖率）", "tdd-test-agent", "S5.3", "pending", "[TDD] 覆盖率按生效规则阈值（Java 默认 80%），不足则补测试"],
         ["S5.5", "架构审查", "architecture-reviewer-agent", "S5.4", "pending", "[TDD]"],
         ["S5.6", "Refactor（可选）", "tdd-test-agent", "S5.5", "pending", "[TDD] 重构后测试仍需全绿"],
         ["S5-R", "受影响模块全量回归", "feature-dev-manager-agent", "S5,S5.6", "pending", "不带测试选择器，Small 不得豁免"],

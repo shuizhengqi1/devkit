@@ -26,6 +26,22 @@ def find_global_cli() -> Path | None:
     return None
 
 
+# npm 发行形态（016 T-31 / D-91）：PATH 上的 devkit-flow 是薄启动器，代码本体是同级 devkit_flow_main.py。
+NPM_CLI_MODULE_FILENAME = "devkit_flow_main.py"
+
+
+def cli_code_path(path: Path) -> Path:
+    """CLI 文件的代码本体：npm 发行形态的启动器 ``devkit-flow`` 取同级模块，其余形态（单文件 bundle）取文件本身。
+
+    与 ``current_cli_path()``（运行中的代码本体）同口径比较内容，用于 doctor 判断全局 CLI 是否就是正在运行的 CLI。
+    """
+    resolved = Path(path).resolve()
+    module = resolved.with_name(NPM_CLI_MODULE_FILENAME)
+    if resolved.name == "devkit-flow" and module.is_file():
+        return module
+    return resolved
+
+
 def extract_embedded_version(path: Path) -> str | None:
     """不执行文件，从头部文本中提取 VERSION 常量（读不到/没有则 None）。"""
     try:

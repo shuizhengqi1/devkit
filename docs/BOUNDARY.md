@@ -3,6 +3,7 @@
 Name: devkit
 License: MIT
 Public version: 0.1.0
+Upstream cut: 3aa28703 (upstream 2.48.2)
 Hosts in this tree: Claude Code, Codex, Grok Build
 History: this directory is a new tree. It does not carry the private upstream git history.
 
@@ -27,7 +28,7 @@ These paths from the upstream are not copied, because they call internal systems
 
 - `src/devkit_flow/ones.py`, `ones_sync.py`
 - `src/devkit_flow/bridge*.py` (SSO cookies and chat bridge)
-- `src/devkit_flow/feedback.py`, `sre.py`
+- `src/devkit_flow/feedback.py`, `sre.py`, `telemetry_ledger.py`
 - `packages/agents/sre-agent.md`, `apidoc-checker-agent.md`
 - `packages/skills/devkit-feedback/`, `gate-notify/`, `devkit-release-manager/`, `feature-retro/`
 - `commands/feedback.md`, `commands/sre.md`

@@ -93,6 +93,13 @@ class HtmlUiSwitch:
 
 
 @dataclass(frozen=True)
+class ProgressBarSwitch:
+    enabled: bool
+    source: str
+    default_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class SpecArtifactsSwitch:
     enabled: bool
     source: str

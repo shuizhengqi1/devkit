@@ -35,7 +35,7 @@
 条件行：S5.1-F（fund-security）与 S5-E2E（e2e）配置关闭时不生成，开启后由 flow migrate-steps 补行。
 | S5.1 | 实现代码 | dev-task-executor-agent | S5 | pending | [传统] |
 | S5.1-F | 资金安全风险分析 | fund-security-analyzer | S5.1 | pending | [传统] 风险关闭后才能进入单元测试/Review |
-| S5.2 | 单元测试 | unit-test-agent | S5.1-F | pending | [传统] ≥80% 覆盖率 |
+| S5.2 | 单元测试 | unit-test-agent | S5.1-F | pending | [传统] 覆盖率按生效规则阈值（Java 默认 80%） |
 | S5.3 | 架构审查 | architecture-reviewer-agent | S5.2 | pending | [传统] |
 | S5-R | 受影响模块全量回归 | feature-dev-manager-agent | S5,S5.3 | pending | 不带测试选择器，Small 不得豁免 |
 | S5-E2E | 需求准出 e2e 门 | feature-dev-manager-agent | S5-R | pending | devkit 只读 quality-gate.json 判门；无跨进程面须 skipped + 书面理由 |
@@ -44,11 +44,11 @@
 
 <!-- [TDD流水线] 用户选 TDD 模式时，将以下行追加到上方表格：
 条件行：S5.2-F（fund-security）与 S5-E2E（e2e）配置关闭时不生成，开启后由 flow migrate-steps 补行。
-| S5.1 | Red Phase（测试先行） | tdd-test-agent | S5 | pending | [TDD] 编写失败测试 + 骨架类，等待用户确认 |
+| S5.1 | Red Phase（测试先行） | tdd-test-agent | S5 | pending | [TDD] 编写失败测试 + 骨架类；已授权范围内自动推进；用户停止 / 必要输入缺失 / 适用人工 Gate 时暂停 |
 | S5.2 | 实现代码 | dev-task-executor-agent | S5.1 | pending | [TDD] 使测试通过 |
 | S5.2-F | 资金安全风险分析 | fund-security-analyzer | S5.2 | pending | [TDD] 风险关闭后才能进入 Green/Review |
-| S5.3 | Green Phase（验证通过） | tdd-test-agent | S5.2-F | pending | [TDD] 运行测试确认全绿，等待用户确认 |
-| S5.4 | Coverage Analysis（覆盖率） | tdd-test-agent | S5.3 | pending | [TDD] ≥80%，不足则补测试 |
+| S5.3 | Green Phase（验证通过） | tdd-test-agent | S5.2-F | pending | [TDD] 运行测试确认全绿；已授权范围内自动推进；用户停止 / 必要输入缺失 / 适用人工 Gate 时暂停 |
+| S5.4 | Coverage Analysis（覆盖率） | tdd-test-agent | S5.3 | pending | [TDD] 覆盖率按生效规则阈值（Java 默认 80%），不足则补测试 |
 | S5.5 | 架构审查 | architecture-reviewer-agent | S5.4 | pending | [TDD] |
 | S5.6 | Refactor（可选） | tdd-test-agent | S5.5 | pending | [TDD] 重构后测试仍需全绿 |
 | S5-R | 受影响模块全量回归 | feature-dev-manager-agent | S5,S5.6 | pending | 不带测试选择器，Small 不得豁免 |

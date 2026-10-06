@@ -15,7 +15,7 @@ Agent definitions with platform-agnostic frontmatter:
 - `prd-analyzer-agent.md` - Analyze PRD quality and generate FEATURE.md
 - `change-impact-analyzer-agent.md` - Analyze clarification/change impact and update CHANGELOG routing
 - `tech-design-architect-agent.md` - Create technical design documents
-- `architecture-reviewer-agent.md` - Four-layer DDD architecture compliance auditor (cross-cutting topics via specrules/rules/index.md §4)
+- `architecture-reviewer-agent.md` - Four-layer DDD architecture compliance auditor (cross-cutting topics via the entry index's declared loading protocol, e.g. root package §4 trigger table)
 - `apidoc-checker-agent.md` - API documentation annotation completeness checker
 - `design-doc-reviewer-agent.md` - Design document compliance reviewer (project template)
 

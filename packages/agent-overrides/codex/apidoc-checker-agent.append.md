@@ -2,8 +2,8 @@
 
 You are running under the Codex runtime. Do **not** use Codex native `/review`.
 
-1. **Single-pass complete**: list every BLOCKING API/CLI contract defect now. Do not return 1–3 items and wait for a rerun.
-2. Report header must include `findings_complete: true`.
-3. Include any BLOCKING item you would otherwise save for the next round.
-4. Verify-only mode only checks `prior_findings`. Round 2+ is verify-only unless the user explicitly requests 全量复审.
-5. Missing Thrift/`@InterfaceDoc` is not BLOCKING when the document declares no business RPC.
+1. **Single-pass complete**: list every `class=blocking` API/CLI contract defect now. Do not return 1–3 items and wait for a rerun.
+2. Report header (before the first `## ` heading, next to the `结果文件:` / `结论:` lines) must include `findings_complete: true`.
+3. Include any `blocking` item you would otherwise save for the next round.
+4. Verify-only mode only checks `prior_findings`. Round 2+ is verify-only unless the user explicitly requests 全量复审. A verify-only round still rewrites the **complete** `review-apidoc.result.json` (`round` + 1, `previousResultSha256` = sha256 of the existing result file bytes computed **before** overwriting it — equal to the current header `sha256=` value; this value is not stored inside the JSON — all findings with stable ids) and updates the header lines.
+5. A Java API module is any Java module (`kind=java-*` or `languages` containing `java`) unless explicitly declared non-Maven (manual verification per reviewer degradation branch (a)；配置覆盖（本版本未提供，后续 feature）); detector-inferred `publishForm` (including `app-deploy`) never exempts it (Java API 模块：Java 模块（`kind=java-*` 或 `languages` 含 `java`），除非显式声明为非 Maven；不读识别器推断的 `publishForm`，D-102). When no module is a Java API module or the interface document declares no business RPC, missing Thrift/`@InterfaceDoc` is `not-applicable` (write the reason in `evidence.excerpt`); for Java API modules (including `publishForm=unknown` or detector-inferred `app-deploy`) a missing annotation stays `blocking` per canonical 3.1. The 6-class `apiImpactClass` / `apiImpactEvidence` fields and `verdict = pass ⇔ openBlocking == 0 ∧ score ≥ 90` follow `api_version_policy.md` / `review_classification.md` only.
