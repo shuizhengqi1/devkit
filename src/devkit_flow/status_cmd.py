@@ -15,6 +15,7 @@ from devkit_flow.flow_batch import FLOW_OPS_LEDGER_FILE, FlowOpLedger
 from devkit_flow.parse_util import find_features, parse_task_table, select_feature, task_path_for_feature
 from devkit_flow.project_detect import ProfileCache, ProjectDetector
 from devkit_flow.review import design_template_summary, format_design_template_status_text, format_review_rounds_status_text, review_rounds_summary
+from devkit_flow.session_binding import attach_session_bindings
 from devkit_flow.rule_sources import RULES_OK_STATUSES, BindingReceipt, compute_rule_context
 from devkit_flow.switches import dashboard_switch_summary, docs_curator_summary, format_dashboard_status_text, format_docs_curator_status_text, format_html_ui_status_text, format_progress_bar_status_text, format_spec_artifacts_status_text, format_specrules_status_text, html_ui_summary, progress_bar_summary, spec_artifacts_summary, specrules_routing_preview, specrules_summary
 from devkit_flow.telemetry import telemetry_config_summary
@@ -811,6 +812,8 @@ def format_text(data: dict[str, Any]) -> str:
 def command_status(args: argparse.Namespace) -> int:
     workspace = Path.cwd()
     data = select_feature(find_features(workspace), args.feature)
+    # 017 progress-mod-focus：会话绑定（只读、加性；ok → 顶层，multi → features[] 每项）。
+    attach_session_bindings(data, workspace)
     data["integrations"] = {
         "ones": ones_config_summary(workspace),
         "telemetry": telemetry_config_summary(workspace),

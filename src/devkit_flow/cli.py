@@ -14,6 +14,7 @@ from devkit_flow.project_detect import command_project_detect
 from devkit_flow.rule_sources import command_project_rules
 from devkit_flow.review import command_design_template_configure, command_design_template_status, command_review_rounds_check, command_review_rounds_configure, command_review_rounds_reset, command_review_rounds_status, command_review_rounds_tick
 from devkit_flow.review_result import command_review_result_verify
+from devkit_flow.session_binding import is_takeover, record_takeover
 from devkit_flow.session_registry import command_sessions_list, latest_marker
 from devkit_flow.setup import command_doctor, command_setup
 from devkit_flow.status_cmd import command_status
@@ -25,6 +26,17 @@ from devkit_flow.workflow_auto import command_workflow_configure, command_workfl
 _INTENT_EVENT_TYPES = frozenset(
     {"ones_follow_up", "write_workflow_report", "open_local_html_report", "quality_collect"}
 )
+
+
+def _takeover_for(command: str, *, require_branch_match: bool = False):
+    """017：flow next 接手记录闭包（D-2 分支门控在 record_takeover 内）；吞掉一切异常。"""
+    def _record(workspace: Path, feature: dict[str, Any]) -> None:
+        try:
+            record_takeover(workspace, feature, command=command, require_branch_match=require_branch_match)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _record
 
 
 def _side_effects_for(args: Any, *, command: str):
@@ -222,6 +234,12 @@ def _dispatch_write_side_effects(
 ) -> dict[str, Any]:
     """写命令副作用唯一编排点（设计 §4.4.1）：摘 `_events`、telemetry、ONES、report。"""
     from devkit_flow.telemetry import TelemetryEmitter, schedule_background_flush
+    # 017 progress-mod-focus：成功路径记录 feature 接手（写命令不看分支）；fail-safe，不影响后续副作用。
+    try:
+        if is_takeover(command, data, subcommand=getattr(args, "flow_clarify_command", None)):
+            record_takeover(Path.cwd(), feature, command=command)
+    except Exception:  # noqa: BLE001
+        pass
     del args  # 签名契约保留；事件已编码 no_open / command 边界。
     result = dict(data)
     events = result.pop("_events", None)
@@ -490,7 +508,7 @@ def _dispatch_flow(args: Any) -> int | None:
     from devkit_flow.report import command_flow_report
 
     if args.flow_command == "next":
-        return command_flow_next(args)
+        return command_flow_next(args, takeover=_takeover_for("flow next", require_branch_match=True))
     if args.flow_command == "set":
         return command_flow_set(args, dashboard_refresh=refresh_dashboard_after_write, gate_guard=evaluate_e2e_gate, side_effects=_side_effects_for(args, command="flow set"))
     if args.flow_command == "batch-set":

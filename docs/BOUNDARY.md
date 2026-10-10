@@ -3,7 +3,7 @@
 Name: devkit
 License: MIT
 Public version: 0.1.0
-Upstream cut: 3aa28703 (upstream 2.48.2)
+Upstream cut: d9226df6 (upstream 2.49.0)
 Hosts in this tree: Claude Code, Codex, Grok Build
 History: this directory is a new tree. It does not carry the private upstream git history.
 

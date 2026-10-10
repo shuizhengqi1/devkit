@@ -55,16 +55,18 @@ const BADGE_TEXT = ' ◆ DEVKIT '
 const BADGE_STYLE = { backgroundColor: '#1e3a8a', color: '#e0f2fe', bold: true }
 const PANE_HINT_ARROW = '→ '
 const PANE_HINT_COMMAND = '/devkit'
-const MULTI_ITEM_GAP = '  ·  '
 const BAR_MODE_RUN = 'run'
 const BAR_MODE_WAIT = 'wait'
 const BAR_MODE_BLOCK = 'block'
 const BAR_MODE_DONE = 'done'
+// progress-mod-focus R7：pending 及其他未关闭状态（不再误显示为运行中）；无扫光、无呼吸、无 → /devkit。
+const BAR_MODE_PENDING = 'pending'
 const CAPSULES = {
   [BAR_MODE_RUN]: { icon: '▶', label: '运行中', backgroundColor: '#0e7490', color: '#ecfeff' },
   [BAR_MODE_WAIT]: { icon: '⏸', label: '待确认', backgroundColor: '#b45309', color: '#fffbeb' },
   [BAR_MODE_BLOCK]: { icon: '✖', label: '阻塞', backgroundColor: '#b91c1c', color: '#fef2f2' },
   [BAR_MODE_DONE]: { icon: '✔', label: '全部完成', backgroundColor: '#047857', color: '#ecfdf5' },
+  [BAR_MODE_PENDING]: { icon: '·', label: '待开始', backgroundColor: '#475569', color: '#f1f5f9' },
 }
 
 // 进度条绘制方式（§4.2.7 降级链）：'raster' 动效（默认）、'static' 只画静态帧、'text' 第 1 版 Text 进度条。
@@ -133,6 +135,9 @@ const KIND_ABSENT = 'absent'
 const KIND_IDLE = 'idle'
 const KIND_ACTIVE = 'active'
 const KIND_MULTI = 'multi'
+// progress-mod-focus：聚焦来源。只有 kind=active 且 focusSource 非空才算「已聚焦」（被动展示面只认已聚焦）。
+const FOCUS_SESSION = 'session'
+const FOCUS_BRANCH = 'branch'
 
 const STATUS_OK = 'ok'
 const STATUS_MULTIPLE = 'multiple_active_features'
@@ -165,6 +170,10 @@ const PANE_FOOTER_SCROLL_TEXT = '↑↓ 滚动 · Esc 关闭'
 // 非 active 面板已有「r: 刷新」按钮，底部只提示 Esc（D-24 去重）。
 const PANE_FOOTER_PLAIN_TEXT = 'Esc 关闭'
 // 多 feature 面板（D-24）：进行中一组 + 步骤已全部关闭一组。
+// progress-mod-focus（D-1）：主动展示面在未聚焦时的提示。
+const UNFOCUSED_PANE_TEXT = '未聚焦：该 feature 不属于本会话或当前分支，进度行不显示'
+const UNFOCUSED_LIST_TEXT = '没有属于本会话或当前分支的 feature，进度行不显示'
+const UNFOCUSED_REFRESH_SUFFIX = '（未聚焦，进度行不显示）'
 const MULTI_ACTIVE_TITLE = '进行中的 DevKit feature：'
 const MULTI_NONE_TEXT = '当前没有进行中的步骤。'
 const MULTI_CLOSED_TITLE = '步骤已全部关闭，可执行 flow complete：'
@@ -233,7 +242,8 @@ function barModeOf(current) {
   if (!current) return BAR_MODE_DONE
   if (current.state === 'waiting-confirmation') return BAR_MODE_WAIT
   if (current.state === 'blocked') return BAR_MODE_BLOCK
-  return BAR_MODE_RUN
+  if (current.state === 'in-progress') return BAR_MODE_RUN
+  return BAR_MODE_PENDING
 }
 
 function colorOfState(state) {
@@ -323,16 +333,25 @@ function createSnapshot(kind, fields) {
     total: 0,
     bandEnabled: true,
     switchSource: '',
+    // progress-mod-focus：STATUS「分支」（单活跃取 summary.branch）、本 feature 的会话绑定、聚焦来源。
+    branch: '',
+    sessionBinding: null,
+    focusSource: '',
+    // focusSource=session 时，判定聚焦所用的会话 id（记账前与当前会话 id 复核，S5.7 codex P2）。
+    focusSessionId: '',
     ...(fields || {}),
   }
 }
 
-// Snapshot.isVisible：multi 只有存在可计数（current_step≠null）的 feature 时才显示；
-// 全部步骤已关闭的僵尸 feature 不足以显示进度行（与无流程一致，D-24）。
+// Snapshot.isFocused（progress-mod-focus）：属于本会话（会话绑定）或当前分支的单个 feature。
+function isFocused(snap) {
+  return snap.kind === KIND_ACTIVE && snap.focusSource !== ''
+}
+
+// Snapshot.isVisible（progress-mod-focus，取代 D-24/D-25 口径）：只有已聚焦（会话 > 分支）的 feature 显示进度行；
+// 未聚焦的单活跃与 multi 名单一律不显示（不提示，D-1）。
 function isSnapshotVisible(snap) {
-  if (!snap.bandEnabled) return false
-  if (snap.kind === KIND_ACTIVE) return true
-  return snap.kind === KIND_MULTI && snap.features.length > 0
+  return snap.bandEnabled && isFocused(snap)
 }
 
 // Snapshot.hasTasks：有可显示的任务统计（「任务 a/b」显示条件）。
@@ -359,6 +378,16 @@ function textOf(value) {
   return ''
 }
 
+// SessionBinding（progress-mod-focus）：status 的 session_binding → { sessionId, seq } | null。
+// session_id 为非空字符串且 seq 为 ≥ 1 的整数才有效（与 CLI 取值域一致）。
+function toSessionBinding(raw) {
+  if (!isPlainObject(raw)) return null
+  const sessionId = typeof raw.session_id === 'string' ? raw.session_id.trim() : ''
+  const seq = raw.seq
+  if (!sessionId || typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) return null
+  return { sessionId, seq }
+}
+
 function toStepView(raw) {
   if (!isPlainObject(raw)) return null
   return { id: textOf(raw.id), name: textOf(raw.name), state: textOf(raw.state), note: textOf(raw.note) }
@@ -375,6 +404,7 @@ function toFeatureBrief(raw) {
     currentStep: toStepView(raw.current_step),
     // STATUS「分支」（D-24 加性字段）；旧 CLI 无此字段时为空串，不参与分支聚焦。
     branch: textOf(raw.branch).trim(),
+    sessionBinding: toSessionBinding(raw.session_binding),
   }
 }
 
@@ -450,6 +480,8 @@ function classifyStatus(data, workspace) {
       closed: stepsClosed + tasks.closed,
       total: stepsTotal + tasks.total,
       ...switchFieldsOf(data),
+      branch: textOf(summary.branch).trim(),
+      sessionBinding: toSessionBinding(data.session_binding),
     })
   }
   if (status === STATUS_MULTIPLE) {
@@ -511,7 +543,7 @@ async function resolveGitRoot($) {
   }
 }
 
-// StatusProbe.fallbackCliPath：<HOME>/.devkit/bin/devkit-flow；取不到 HOME 时返回 null。
+// StatusProbe.fallbackCliPath：<HOME>/.config/devkit/bin/devkit-flow；取不到 HOME 时返回 null。
 async function fallbackCliPath($) {
   try {
     const home = await $.env.get('HOME')
@@ -591,38 +623,78 @@ async function fetchFeature($, probe, workspace, name) {
   return snap.kind === KIND_ACTIVE && snap.feature === name ? snap : null
 }
 
-// StatusProbe.focusTarget（D-25，修正 D-24）：multi 时选聚焦对象，返回 feature 名或空串（不聚焦）。
-// ① 当前分支对应的 feature（含 current_step=null 者）恰 1 个 → 它；② 否则可计数（current_step≠null）的恰 1 个 → 它；
-// ③ 否则空串（名单）。没有任何条目带 branch（旧 CLI）时不跑 git，直接走 ②。
-async function focusTarget($, workspace, multi) {
-  const briefs = [...multi.features, ...multi.closedFeatures]
-  if (briefs.some((item) => item.branch !== '')) {
-    const branch = await currentBranch($, workspace)
-    if (branch !== null) {
-      const matches = briefs.filter((item) => item.branch !== '' && item.branch === branch)
-      if (matches.length === 1) return matches[0].feature
-    }
+// FocusPolicy.briefOfActive：ACTIVE 快照 → 单元素候选（与 multi 名单同形，供同一套聚焦规则使用）。
+function briefOfActive(snap) {
+  return { feature: snap.feature, featureDir: snap.featureDir, branch: snap.branch, sessionBinding: snap.sessionBinding }
+}
+
+// FocusPolicy.pickSessionFocus：绑定本会话的候选中取 seq 最大者（最近一次接手，R2a）；无则空串。纯函数。
+function pickSessionFocus(briefs, sessionId) {
+  if (!sessionId) return ''
+  let best = null
+  for (const item of briefs) {
+    const binding = item.sessionBinding
+    if (binding === null || binding.sessionId !== sessionId) continue
+    if (best === null || binding.seq > best.sessionBinding.seq) best = item
   }
-  return multi.features.length === 1 ? multi.features[0].feature : ''
+  return best === null ? '' : best.feature
 }
 
-// StatusProbe.focus（D-25）：按 focusTarget 以 `status --feature` 取单 feature 数据；取数失败一律沿用名单（不改选 ②，
-// 避免瞬时失败让进度行在两个 feature 之间跳动）。全程在同一次 runOnce 内顺序执行，status 进程至多一个在途。
-async function focusMulti($, probe, workspace, multi) {
-  const name = await focusTarget($, workspace, multi)
-  if (name === '') return multi
-  const focused = await fetchFeature($, probe, workspace, name)
-  return focused === null ? multi : focused
+// FocusPolicy.pickBranchFocus：STATUS「分支」等于当前 git 分支的候选恰 1 个时返回它；否则空串。纯函数。
+function pickBranchFocus(briefs, branch) {
+  if (!branch) return ''
+  const matches = briefs.filter((item) => item.branch !== '' && item.branch === branch)
+  return matches.length === 1 ? matches[0].feature : ''
 }
 
-// StatusProbe.probe：git 根失败即 absent，且不调用 status；multi 时按 D-25 聚焦顺序尝试聚焦。
-async function probeSnapshot($, probe) {
+// StatusProbe.focusTarget（progress-mod-focus，取代 D-25）：会话 > 分支 > 不聚焦，单活跃与 multi 同一规则。
+// 只在有候选带会话绑定时才读会话 id（失败沿用缓存 id）；只在有候选带分支时才跑 git。
+async function focusTarget($, workspace, briefs, fallbackSessionId) {
+  if (briefs.some((item) => item.sessionBinding !== null)) {
+    const sessionId = (await readSessionId($)) || fallbackSessionId || null
+    const name = pickSessionFocus(briefs, sessionId)
+    if (name !== '') return { name, source: FOCUS_SESSION, sessionId }
+  }
+  if (briefs.some((item) => item.branch !== '')) {
+    const name = pickBranchFocus(briefs, await currentBranch($, workspace))
+    if (name !== '') return { name, source: FOCUS_BRANCH }
+  }
+  return { name: '', source: '' }
+}
+
+// StatusProbe.focus：单活跃按规则判定是否聚焦（不聚焦时保留详情供面板展示）；multi 按聚焦对象以
+// `status --feature` 取单 feature 数据，取数失败沿用名单（不改选）。全程在同一次 runOnce 内顺序执行。
+async function focusSnapshot($, probe, workspace, snap, fallbackSessionId) {
+  if (snap.kind === KIND_ACTIVE) {
+    const target = await focusTarget($, workspace, [briefOfActive(snap)], fallbackSessionId)
+    return target.name === snap.feature ? withFocus(snap, target) : snap
+  }
+  const target = await focusTarget($, workspace, [...snap.features, ...snap.closedFeatures], fallbackSessionId)
+  if (target.name === '') return snap
+  const focused = await fetchFeature($, probe, workspace, target.name)
+  return focused === null ? snap : withFocus(focused, target)
+}
+
+function withFocus(snap, target) {
+  return { ...snap, focusSource: target.source, focusSessionId: target.source === FOCUS_SESSION ? target.sessionId : '' }
+}
+
+// Snapshot.isFocusedFor：记账用的聚焦复核。按会话聚焦的快照只对判定时的那个会话有效；/clear 或 REPL 内 resume
+// 换了 id 后、下一次刷新重新判定前（子 agent 轮不先刷新），不得把新会话的用量记进该 feature（S5.7 codex P2）。
+function isFocusedFor(snap, sessionId) {
+  if (!isFocused(snap)) return false
+  return snap.focusSource !== FOCUS_SESSION || snap.focusSessionId === sessionId
+}
+
+// StatusProbe.probe：git 根失败即 absent，且不调用 status；active / multi 都经聚焦判定（progress-mod-focus）。
+async function probeSnapshot($, probe, fallbackSessionId) {
   const workspace = await resolveGitRoot($)
   if (workspace === null) return createSnapshot(KIND_ABSENT)
   const data = await runStatus($, probe, workspace)
   if (data === null) return createSnapshot(KIND_ABSENT)
   const snap = classifyStatus(data, workspace)
-  return snap.kind === KIND_MULTI ? focusMulti($, probe, workspace, snap) : snap
+  if (snap.kind !== KIND_ACTIVE && snap.kind !== KIND_MULTI) return snap
+  return focusSnapshot($, probe, workspace, snap, fallbackSessionId)
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +960,9 @@ function recordUsage($, ledger, usage, isSubagent, snap) {
 async function recordUsageTask($, ledger, usage, isSubagent, snap) {
   if (!(await syncSessionTask($, ledger))) return
   addUsageToBucket(isSubagent ? ledger.sessionSub : ledger.sessionMain, usage)
-  if (snap.kind !== KIND_ACTIVE) return
+  // progress-mod-focus：只给已聚焦的 feature 记账（未聚焦的 feature 不属于本会话或当前分支）；
+  // 按会话聚焦时还要求判定所用的会话 id 等于当前会话 id。
+  if (!isFocusedFor(snap, ledger.sessionId)) return
   const key = ledgerKeyOf(ledger, snap.workspace, snap.feature)
   if (key !== ledger.currentKey) {
     ledger.currentEntry = await loadLedgerEntry($, key)
@@ -1023,6 +1097,8 @@ async function readCostUsd($) {
 // 合并比例增大时给进度行登记推进动画（同步、不调度；随后的 invalidate → band render → attach 取 f0）。
 // toast 在独立 try/catch 内调用：宿主抛错只丢掉这条提示。首次刷新（prev 为 loading）与切换 feature 不可比较。
 function advanceOnRefreshed($, mod, prev, next) {
+  // progress-mod-focus：前后两次都已聚焦才判定（未聚焦的 feature 不 toast、不播推进）。
+  if (!isFocused(prev) || !isFocused(next)) return undefined
   const advance = diffSnapshots(prev, next)
   if (!advance.comparable) return undefined
   let pending
@@ -1056,7 +1132,7 @@ function notifyRefreshed($, mod, prev, next) {
 async function runOnce($, mod) {
   let next
   try {
-    next = await withProbe(mod.probe, () => probeSnapshot($, mod.probe))
+    next = await withProbe(mod.probe, () => probeSnapshot($, mod.probe, mod.ledger.sessionId))
   } catch {
     next = createSnapshot(KIND_ABSENT)
   }
@@ -1823,7 +1899,7 @@ function spinnerSuffixOf(snap, base) {
 
 // SpinnerSuffix.render（不调用宿主 API）
 function renderSpinner(e, next, snap) {
-  if (!(e && isPlainObject(e.props)) || snap.kind !== KIND_ACTIVE || !snap.bandEnabled || !snap.current) return next(e)
+  if (!(e && isPlainObject(e.props)) || !isFocused(snap) || !snap.bandEnabled || !snap.current) return next(e)
   const base = e.props.message ?? e.props.word
   return next({ ...e, props: { ...e.props, suffix: spinnerSuffixOf(snap, base) } })
 }
@@ -1954,42 +2030,8 @@ function fitSegments(segments, columns) {
   return current
 }
 
-// BandRenderer.buildMultiSegments：` ◆ DEVKIT `、`N 个进行中`、各 feature「名称 当前步骤 id」、`→ /devkit`，
-// 右组本会话 token；超宽时先去右组，再从名单末尾逐项折叠为「等 N 个」（至少保留 1 项）。
-function buildMultiSegments(snap, ledger, columns) {
-  const items = snap.features
-  const build = (keep, withRight) => {
-    const runs = []
-    items.slice(0, keep).forEach((item, index) => {
-      if (index > 0) runs.push(run(MULTI_ITEM_GAP, { dimColor: true }))
-      runs.push(run(item.feature))
-      // snap.features 只含 current_step≠null 的 feature（D-24），步骤全关者不进进度行。
-      const step = item.currentStep
-      if (step.id) runs.push(run(' ' + step.id, { color: 'cyan' }))
-    })
-    if (keep < items.length) runs.push(run('  等 ' + (items.length - keep) + ' 个', { dimColor: true }))
-    const segments = [
-      badgeSegment(),
-      segment('M1', 'left', 0, [run(items.length + ' 个进行中', { bold: true })]),
-      segment('M2', 'left', 0, runs),
-      hintSegment(),
-    ]
-    if (withRight) segments.push(segment('S5b', 'right', 3, [run('· 会话 ' + formatCount(sessionTotal(ledger)), { dimColor: true })]))
-    return segments
-  }
-  let keep = items.length
-  let segments = build(keep, true)
-  if (segmentsWidth(segments) <= columns) return segments
-  segments = build(keep, false)
-  while (keep > 1 && segmentsWidth(segments) > columns) {
-    keep -= 1
-    segments = build(keep, false)
-  }
-  return segments
-}
-
+// BandRenderer.segmentsFor：只处理已聚焦的 active 快照（progress-mod-focus：进度行不再有名单形态）。
 function bandSegmentsFor(snap, ledger, cost, columns) {
-  if (snap.kind === KIND_MULTI) return buildMultiSegments(snap, ledger, columns)
   return fitSegments(buildSegments(snap, ledger, cost), columns)
 }
 
@@ -2584,6 +2626,7 @@ function renderPane(ui, e, mod, frame, handlers) {
   if (snap.kind !== KIND_ACTIVE) {
     detachSite(mod.animator, SITE_PANE)
     if (snap.kind === KIND_MULTI && !snap.bandEnabled) rows.push(switchOffLine(ui, snap))
+    if (snap.kind === KIND_MULTI) rows.push(line(ui, UNFOCUSED_LIST_TEXT, { dimColor: true }))
     if (snap.kind === KIND_MULTI) rows.push(...multiPaneRows(ui, pane, columns, handlers.onDrill))
     else if (snap.kind === KIND_IDLE) rows.push(line(ui, IDLE_TEXT))
     else rows.push(line(ui, ABSENT_TEXT))
@@ -2594,6 +2637,8 @@ function renderPane(ui, e, mod, frame, handlers) {
   }
   const headerHandlers = { ...handlers, onBack: view === pane ? null : handlers.onBack }
   rows.push(...renderPaneHeader(ui, e, mod, view, columns, frame, headerHandlers))
+  // progress-mod-focus（D-1）：单活跃未聚焦时详情照常，头部下方提示进度行不显示（名单下钻的详情不加）。
+  if (view === pane && !isFocused(snap)) rows.push(line(ui, UNFOCUSED_PANE_TEXT, { dimColor: true }))
   let footer = PANE_FOOTER_TEXT
   if (pane.tab === PANE_TAB_TASKS) {
     rows.push(...renderTasksTab(ui, e, view, columns))
@@ -2635,7 +2680,8 @@ function refreshText(snap) {
     text = '已刷新：' + snap.feature + ' ' + snap.closed + '/' + snap.total
     if (hasTasks(snap)) text += '（步骤 ' + snap.stepsClosed + '/' + snap.stepsTotal + ' · 任务 ' + snap.tasksClosed + '/' + snap.tasksTotal + '）'
     if (!snap.current) text += REFRESH_DONE_SUFFIX
-  } else if (snap.kind === KIND_MULTI) text = multiRefreshText(snap)
+    if (!isFocused(snap)) text += UNFOCUSED_REFRESH_SUFFIX
+  } else if (snap.kind === KIND_MULTI) text = multiRefreshText(snap) + UNFOCUSED_REFRESH_SUFFIX
   else if (snap.kind === KIND_IDLE) text = '已刷新：当前没有进行中的 DevKit feature'
   else text = '已刷新：未检测到 DevKit 流程'
   const flowing = snap.kind === KIND_ACTIVE || snap.kind === KIND_MULTI

@@ -1626,7 +1626,11 @@ def next_action_text(
     return action
 
 
-def command_flow_next(args: argparse.Namespace) -> int:
+# 017 progress-mod-focus：flow next 接手记录注入缝（cli 装配 `_takeover_for`）。模块级别名，不用 PEP 604。
+FeatureTakeover = Callable[[Path, dict], None]
+
+
+def command_flow_next(args: argparse.Namespace, *, takeover: Optional[FeatureTakeover] = None) -> int:
     workspace = Path.cwd()
     feature = flow_select_feature(workspace, args)
     if feature is None:
@@ -1692,6 +1696,12 @@ def command_flow_next(args: argparse.Namespace) -> int:
             "outbox": flow_outbox_counts(workspace, feature),
         },
     }
+    if takeover is not None:
+        # 017 D-2：分支门控在 takeover 内部完成；任何异常都不影响 flow next 的输出与退出码。
+        try:
+            takeover(workspace, feature)
+        except Exception:  # noqa: BLE001
+            pass
     update = maybe_check_latest_update()
     if update is not None:
         data["update"] = update
