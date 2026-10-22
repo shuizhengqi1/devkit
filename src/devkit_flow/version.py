@@ -5,7 +5,7 @@ from __future__ import annotations
 VERSION = "0.1.0"
 
 
-NPM_PACKAGE_NAME = "devkit-flow"
+NPM_PACKAGE_NAME = "@h-devkit/devkit-flow"
 
 
 NPM_REGISTRY = "https://registry.npmjs.org"

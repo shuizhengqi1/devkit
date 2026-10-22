@@ -1286,10 +1286,10 @@ def parse_args() -> argparse.Namespace:
 
     self_update = subparsers.add_parser(
         "self-update",
-        help="Install the latest devkit-flow from the public npm registry.",
+        help="Install the latest @h-devkit/devkit-flow from the public npm registry.",
         description=(
             "Query the latest version with npm view from https://registry.npmjs.org and install "
-            "it with npm i -g devkit-flow@latest; --check only reports "
+            "it with npm i -g @h-devkit/devkit-flow@latest; --check only reports "
             "whether an update is available and never modifies anything."
         ),
     )

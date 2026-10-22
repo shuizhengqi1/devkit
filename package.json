@@ -1,9 +1,12 @@
 {
-  "name": "devkit",
+  "name": "@h-devkit/devkit-flow",
   "version": "0.1.0",
   "private": false,
   "license": "MIT",
   "description": "Spec-driven development workflow for Claude Code, Codex, and Grok Build.",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "devkit-flow": "bin/devkit-flow"
   }

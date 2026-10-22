@@ -2942,7 +2942,7 @@ def command_doctor(args: argparse.Namespace) -> int:
             "error",
             "devkit-flow is neither on PATH nor installed at ~/.config/devkit/bin/devkit-flow",
             fix=(
-                "npm i -g devkit-flow@latest --registry=https://registry.npmjs.org, "
+                "npm i -g @h-devkit/devkit-flow@latest --registry=https://registry.npmjs.org, "
                 "then keep it fresh with devkit-flow self-update"
             ),
         )

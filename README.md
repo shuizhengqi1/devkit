@@ -44,10 +44,16 @@ Pipeline status changes only through `devkit-flow flow`. Do not hand-edit the st
 
 Issue trackers, remote knowledge bases, chat notifications, and phone-home telemetry are ports. This build ships those ports as off. See [docs/BOUNDARY.md](docs/BOUNDARY.md).
 
-User-level config and caches live in `~/.config/devkit`. Project config stays in `your-repo/.devkit/config.json`. This build does not read or write `~/.config/devkit`.
+User-level config and caches live in `~/.config/devkit`. Project config stays in `your-repo/.devkit/config.json`. This build does not read or write `~/.devkit`.
 
 ## Source
 
-The public git repository is <https://github.com/shuizhengqi1/devkit>. Install from a checkout. This release does not publish an npm package. `devkit-flow` is the Python package name. Do not publish the npm name `devkit`; that name is already taken on the public registry.
+The public git repository is <https://github.com/shuizhengqi1/devkit>. The command is `devkit-flow`. The npm package is `@h-devkit/devkit-flow`:
+
+```bash
+npm i -g @h-devkit/devkit-flow
+```
+
+This checkout is not on npm yet. The pip project name stays `devkit-flow`.
 
 The copyright line in `LICENSE` is `devkit contributors`.
