@@ -3,7 +3,7 @@
 Name: devkit
 License: MIT
 Public version: 0.1.0
-Upstream cut: d9226df6 (upstream 2.49.0)
+Upstream cut: b87f2169 (upstream 2.51.1)
 Hosts in this tree: Claude Code, Codex, Grok Build
 History: this directory is a new tree. It does not carry the private upstream git history.
 
@@ -20,18 +20,19 @@ History: this directory is a new tree. It does not carry the private upstream gi
 
 Specrules default to off. Set a git URL with `devkit-flow specrules configure` when a project has rules.
 
-User-level state (global config, update check, specrules cache, runtime marketplace, session registry) is `~/.config/devkit`. Project state stays in `<repo>/.devkit/`. This tree does not read or write `~/.devkit`.
+User-level state (global config, update check, specrules cache, runtime marketplace, session registry) is `~/.config/devkit`. Project state stays in `<repo>/.devkit/`. This tree does not read or write `~/.config/devkit`.
 
 ## Omitted
 
 These paths from the upstream are not copied, because they call internal systems or carry internal identifiers:
 
 - `src/devkit_flow/ones.py`, `ones_sync.py`
-- `src/devkit_flow/bridge*.py` (SSO cookies and chat bridge)
+- `src/devkit_flow/bridge*.py` (SSO cookies, chat bridge, and watch delivery)
+- `src/devkit_flow/pr_review_*.py` (hosted pull-request review)
 - `src/devkit_flow/feedback.py`, `sre.py`, `telemetry_ledger.py`
-- `packages/agents/sre-agent.md`, `apidoc-checker-agent.md`
+- `packages/agents/sre-agent.md`, `apidoc-checker-agent.md`, `pr-reviewer-agent.md`
 - `packages/skills/devkit-feedback/`, `gate-notify/`, `devkit-release-manager/`, `feature-retro/`
-- `commands/feedback.md`, `commands/sre.md`
+- `commands/feedback.md`, `commands/sre.md`, `commands/pr-review.md`
 - upstream `docs/releases/`, `spec/001-*`, `spec/015-*`, `spec/016-*`
 - `runtime-plugins/` generated copies
 - the bundled `bin/devkit-flow` from upstream
@@ -49,6 +50,6 @@ The manager, technical-design, and design-review prompts in this tree are public
 | External knowledge | off |
 | Identity | git user only, when a command needs a name |
 
-## Before GitHub
+## Publish notes
 
-Run `python3 scripts/check_boundary.py`. Keep the repository private until the copyright holder in `LICENSE` is confirmed and a secret scan of this tree is clean. Do not push the private upstream history.
+Run `python3 scripts/check_boundary.py` before pushing. This tree is a new history. Do not push the private upstream history. The copyright line in `LICENSE` is `devkit contributors`.

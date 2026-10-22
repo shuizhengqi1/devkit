@@ -18,6 +18,151 @@ def _telemetry_span_worker(value: str) -> str:
     return text
 
 
+def _pr_review_older_than(value: str) -> int:
+    text = str(value).strip().lower()
+    number = text[:-1] if text.endswith("d") else text
+    if not number.isdigit():
+        raise argparse.ArgumentTypeError("--older-than must be <Nd> or a non-negative integer")
+    return int(number)
+
+
+def _pr_review_common(
+    parser: argparse.ArgumentParser,
+    *,
+    repo: str = "optional",
+    formats: tuple[str, ...] = ("json", "text"),
+) -> None:
+    """pr-review 通用参数。``--target`` 只表示工作区；目标分支用 ``--base``（DR-41）。"""
+    parser.add_argument("--format", choices=formats, default="text")
+    parser.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="忽略当前仓，按 repos.json 逐仓。",
+    )
+    parser.add_argument(
+        "--target",
+        default=None,
+        metavar="<dir>",
+        help="工作区目录，默认当前目录。",
+    )
+    if repo == "required":
+        parser.add_argument("--repo", required=True, metavar="<project/repo>", help="project/repo。")
+    elif repo == "optional":
+        parser.add_argument(
+            "--repo",
+            default=None,
+            metavar="<project/repo>",
+            help="显式指定 project/repo，覆盖 origin 推导。",
+        )
+
+
+def _pr_review_watch_target(
+    parser: argparse.ArgumentParser,
+    *,
+    formats: tuple[str, ...] = ("json", "text"),
+) -> None:
+    """watch 子命令共用的输出格式与工作区。不带单值 ``--repo``。"""
+    parser.add_argument("--format", choices=formats, default="text")
+    parser.add_argument("--target", default=None, metavar="<dir>", help="工作区目录，默认当前目录。")
+
+
+def _pr_review_watch_identity(parser: argparse.ArgumentParser, *, runtime_required: bool = False) -> None:
+    parser.add_argument("--runtime", required=runtime_required, default=None, metavar="<rt>")
+    parser.add_argument("--session-id", dest="session_id", default=None, metavar="<sid>")
+
+
+_PR_REVIEW_REF = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]*\Z")
+
+
+def _pr_review_ref(value: str) -> str:
+    """会话内 ``--pr`` 是 ``<project>/<repo>#<id>``，不是 017 的整数 PR 号。"""
+    text = str(value).strip()
+    if _PR_REVIEW_REF.fullmatch(text) is None:
+        raise argparse.ArgumentTypeError("--pr must be <project>/<repo>#<id>")
+    return text
+
+
+def _add_pr_review_session(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """会话内执行入口。``show`` 默认只列上次已读唤醒之后的活动。"""
+    show = subparsers.add_parser("show", help="读取 PR 元数据、新活动与改动文件名。")
+    _pr_review_common(show)
+    show.add_argument("--pr", required=True, type=_pr_review_ref, metavar="<project/repo#id>")
+    scope = show.add_mutually_exclusive_group()
+    scope.add_argument("--since-watch", action="store_true", help="只列本会话最近一次已读唤醒以来的新活动（默认）。")
+    scope.add_argument("--all", action="store_true", help="全部活动。")
+
+    prepared = subparsers.add_parser("prepare-review", help="认领台账并准备会话内审查任务。")
+    _pr_review_common(prepared)
+    prepared.add_argument("--pr", required=True, type=_pr_review_ref, metavar="<project/repo#id>")
+    prepared.add_argument("--rereview", action="store_true", help="同 SHA 再开一轮，台账 round+1。")
+    prepared.add_argument("--job", default=None, metavar="<jobId>", help="为该作业生成会话内 task.json。")
+    prepared.add_argument(
+        "--dispatch",
+        default=None,
+        metavar="<playbook>",
+        help="为路由命中的 dispatcher 作业生成会话内 task.json。不能与 --job / --rereview 同用。",
+    )
+
+    reply = subparsers.add_parser("reply", help="回复 PR 评论。")
+    _pr_review_common(reply)
+    reply.add_argument("--pr", required=True, type=_pr_review_ref, metavar="<project/repo#id>")
+    reply.add_argument("--body-file", required=True, metavar="<md>")
+    reply.add_argument("--to", default=None, metavar="<commentId>")
+
+
+def _add_pr_review_watch(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """``pr-review watch``。``converge`` 是内部子命令，不出现在帮助里。"""
+    watch = subparsers.add_parser("watch", help="登记、查询和驱动 PR 监听。")
+    commands = watch.add_subparsers(dest="watch_command", required=True)
+
+    start = commands.add_parser("start", help="登记当前会话的监听。")
+    _pr_review_watch_target(start)
+    _pr_review_watch_identity(start)
+    start.add_argument("--lane", required=True, choices=("author", "review"))
+    start.add_argument("--pr", default=None, metavar="<ref>")
+    start.add_argument("--repo", dest="repos", action="append", default=None, metavar="<project/repo>")
+    start.add_argument("--takeover", action="store_true")
+
+    stop = commands.add_parser("stop", help="注销监听。")
+    _pr_review_watch_target(stop)
+    _pr_review_watch_identity(stop)
+    stop.add_argument("--id", dest="ids", action="append", default=None, metavar="<watchId>")
+    stop.add_argument("--pr", default=None, metavar="<ref>")
+    stop.add_argument("--session", action="store_true", help="注销当前会话的全部监听。")
+    stop.add_argument("--all", action="store_true")
+    stop.add_argument("--yes", action="store_true")
+
+    listed = commands.add_parser("list", help="列出监听。只读。")
+    _pr_review_watch_target(listed)
+    _pr_review_watch_identity(listed)
+    listed.add_argument("--session", action="store_true", help="只列当前会话。")
+    listed.add_argument("--candidates", action="store_true")
+
+    tick = commands.add_parser("tick", help="系统定时器调用的一轮轮询。")
+    _pr_review_watch_target(tick)
+
+    # 内部子命令：只由 tick / SessionEnd / CLI 超时路径派生，帮助里不列出。
+    # 3.9 的 argparse 会把 SUPPRESS 打成 "==SUPPRESS==" 并留在用法括号里，所以再从帮助动作里拿掉。
+    converge = commands.add_parser("converge", help=argparse.SUPPRESS)
+    _pr_review_watch_target(converge)
+    commands._choices_actions = [
+        action for action in commands._choices_actions if getattr(action, "dest", None) != "converge"
+    ]
+    commands.metavar = "{start,stop,list,tick,tail,inbox}"
+
+    tail = commands.add_parser("tail", help="会话内常驻读取本会话队列。")
+    _pr_review_watch_target(tail, formats=("text", "jsonl"))
+    _pr_review_watch_identity(tail, runtime_required=True)
+
+    inbox = commands.add_parser("inbox", help="读取本会话未读事件。")
+    _pr_review_watch_target(inbox)
+    _pr_review_watch_identity(inbox)
+    inbox.add_argument("--all", action="store_true", help="含最近已送达事件。")
+    inbox.add_argument("--drain", action="store_true", help="把未送达事件视为本次送达。")
+    inbox.add_argument("--undelivered", action="store_true", help="自动注入只取尚未送达的事件。")
+
+
 def _telemetry_span_seq(value: str) -> int:
     try:
         parsed = int(value)
@@ -940,7 +1085,7 @@ def parse_args() -> argparse.Namespace:
     project_detect.add_argument(
         "--write-cache",
         action="store_true",
-        help="Write the detected profile to ~/.devkit/cache/project-profiles/ (default: no write).",
+        help="Write the detected profile to ~/.config/devkit/cache/project-profiles/ (default: no write).",
     )
     project_detect.add_argument("--format", choices=("json", "text"), default="text")
     project_rules = project_subparsers.add_parser(
@@ -1299,6 +1444,29 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     runtime_check.add_argument("--format", choices=("json", "text"), default="text")
+    runtime_check.add_argument(
+        "--hook-event",
+        choices=("SessionStart", "PreToolUse"),
+        default=None,
+        help="Hook event for the check envelope (SessionStart uses the global-hint envelope).",
+    )
+
+    runtime_turn_start = runtime_subparsers.add_parser(
+        "turn-start",
+        help="Internal: UserPromptSubmit injects the next watch excerpt (always exit 0).",
+    )
+    runtime_turn_start.add_argument(
+        "--runtime",
+        required=True,
+        choices=("claude-code", "codex", "grok-build"),
+    )
+    runtime_turn_start.add_argument("--target", default=".")
+    runtime_turn_start.add_argument(
+        "--hook-json",
+        action="store_true",
+        help="Emit a UserPromptSubmit hook envelope.",
+    )
+    runtime_turn_start.add_argument("--format", choices=("json", "text"), default="text")
 
     runtime_session_end = runtime_subparsers.add_parser(
         "session-end",
@@ -1444,6 +1612,7 @@ def parse_args() -> argparse.Namespace:
     session_mark.add_argument("--runtime", required=True, choices=CANONICAL_RUNTIME_ORDER)
     session_mark.add_argument("--target", default=".", help="Workspace root (default: current directory).")
     session_mark.add_argument("--session-id", default=None)
+    session_mark.add_argument("--pid", type=int, default=None)
     session_mark.add_argument("--session-file", default=None)
     session_mark.add_argument("--transcript-path", default=None)
     session_mark.add_argument("--format", choices=("json", "text"), default="json")
@@ -1481,4 +1650,15 @@ def parse_args() -> argparse.Namespace:
     ):
         # 016 D-65④：组合无效，直接报参数错误（argparse 口径 exit 2），不静默忽略 replay。
         telemetry_flush.error("argument --replay-quarantine: not allowed with argument --background")
+    if (
+        args.command == "pr-review"
+        and args.pr_review_command == "worktree"
+        and args.worktree_command == "cleanup"
+    ):
+        if not args.processes_stopped:
+            pr_review_worktree_cleanup.error("the argument --processes-stopped is required")
+        if args.all_stale and args.owner:
+            pr_review_worktree_cleanup.error("--owner cannot be combined with --all-stale")
+        if args.lease and not args.owner:
+            pr_review_worktree_cleanup.error("--lease requires --owner")
     return args

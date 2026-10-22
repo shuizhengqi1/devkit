@@ -87,6 +87,7 @@ from devkit_flow.textio import (
     attach_dashboard_warning,
     emit,
     flow_status_write_lock,
+    process_alive,
 )
 
 FLOW_BATCH_SCHEMA_VERSION = 1
@@ -926,15 +927,8 @@ def release_dispatch_lease(op_id: str, lease: Optional[dict[str, Any]]) -> None:
 
 
 def _batch_holder_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return True  # 无法判定：保守视为存活，由到期时间兜底
-    return True
+    # None（无法判定）保守视为存活，由到期时间兜底（DR-9）。
+    return process_alive(pid) is not False
 
 
 def _same_lease(left: Optional[dict[str, Any]], right: Optional[dict[str, Any]]) -> bool:

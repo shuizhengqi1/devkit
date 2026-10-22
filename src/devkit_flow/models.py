@@ -302,3 +302,12 @@ class ReviewGateTiming:
     source: str
     default_timing: str = "dev-once"
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PrReviewSwitch:
+    """``prReview.enabled`` 摘要。全量生效值在 ``pr_review_config.PrReviewConfig``。"""
+
+    enabled: bool
+    source: str
+    default_enabled: bool = False

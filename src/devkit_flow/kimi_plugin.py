@@ -309,6 +309,11 @@ def kimi_plugin_manifest() -> dict[str, Any]:
                 "command": 'devkit-flow runtime session-end --runtime kimi-code --target "${PWD}" --format json',
                 "timeout": 30,
             },
+            {
+                "event": "UserPromptSubmit",
+                "command": 'devkit-flow runtime turn-start --runtime kimi-code --target "${PWD}" --format text',
+                "timeout": 30,
+            },
         ],
     }
 

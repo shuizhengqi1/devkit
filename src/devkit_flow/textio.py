@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import errno
-import fcntl
+
+try:
+    import fcntl  # ast.Try：bundler 不把 fcntl 提升到 bundle 头部（DR-11）
+except ImportError:
+    fcntl = None
 import hashlib
 import importlib.util
 import json
@@ -19,9 +23,250 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
-from devkit_flow.constants import ANSI_ESCAPE, LATEST_CHECK_CACHE_RELATIVE_PATH, MEP_INSTALL_COMMAND, NPM_VIEW_TIMEOUT_SECONDS
+from devkit_flow.constants import (
+    ANSI_ESCAPE,
+    LATEST_CHECK_CACHE_RELATIVE_PATH,
+    MEP_INSTALL_COMMAND,
+    NPM_VIEW_TIMEOUT_SECONDS,
+    PR_REVIEW_LOG_ALIGN_BYTES,
+)
 from devkit_flow.errors import DevkitFlowError, ExternalCommandError
 from devkit_flow.version import NPM_PACKAGE_NAME, NPM_REGISTRY, VERSION
+
+
+class LockBusy(Exception):
+    """非阻塞加锁未取得，或阻塞等待超过 timeout。
+
+    不是「文件系统不支持 flock」。ENOTSUP 等基础设施错误原样抛出，
+    flow status 后备链据此把目录锁判为不可达。
+    """
+
+
+# Windows 阻塞锁只轮询 LK_NBLCK。LK_LOCK 每秒重试约 10 次后抛 OSError，与 flock 不等价（DR-44）。
+_PLATFORM_LOCK_POLL_SECONDS = 0.2
+# fd -> (持有线程, 重入次数, st_dev, st_ino)。
+# 重入以 (线程, 文件身份) 判定。fd 号被复用时旧条目作废，必须重新加操作系统锁。
+_LOCK_REFS: dict[int, tuple[int, int, int, int]] = {}
+_LOCK_REFS_GUARD = threading.Lock()
+
+
+def _errno_values(*names: str) -> frozenset[int]:
+    values: list[int] = []
+    for name in names:
+        value = getattr(errno, name, None)
+        if isinstance(value, int):
+            values.append(value)
+    return frozenset(values)
+
+
+# EACCES 在 POSIX 上不一定是竞争（保留给调用方按「不可达」处理）；Windows locking 冲突常用 EACCES。
+_POSIX_BUSY_ERRNOS = _errno_values("EAGAIN", "EWOULDBLOCK")
+_WINDOWS_BUSY_ERRNOS = _errno_values("EAGAIN", "EWOULDBLOCK", "EACCES", "EDEADLK", "EDEADLOCK")
+
+
+def _is_posix_contention(exc: BaseException) -> bool:
+    if isinstance(exc, BlockingIOError):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _POSIX_BUSY_ERRNOS
+
+
+def _is_windows_contention(exc: BaseException) -> bool:
+    if isinstance(exc, BlockingIOError):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _WINDOWS_BUSY_ERRNOS
+
+
+def _win_byte_lock(fd: int, mode: int) -> None:
+    """对 fd 首字节加/解锁。空文件不补字节：锁定超出 EOF 的 1 字节区间。"""
+    import msvcrt
+
+    saved = os.lseek(fd, 0, os.SEEK_CUR)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, mode, 1)
+    finally:
+        try:
+            os.lseek(fd, saved, os.SEEK_SET)
+        except OSError:
+            pass
+
+
+def _os_acquire(fd: int, *, blocking: bool, timeout: float | None) -> None:
+    """读模块全局 ``fcntl``：bundle 扁平命名空间里，flow status 单测会换成假实现。"""
+    if fcntl is not None:
+        if blocking and timeout is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as exc:
+                if not _is_posix_contention(exc):
+                    raise
+                if not blocking or (deadline is not None and time.monotonic() >= deadline):
+                    raise LockBusy("file lock busy") from exc
+                time.sleep(_PLATFORM_LOCK_POLL_SECONDS)
+    import msvcrt
+
+    deadline = time.monotonic() + max(0.0, timeout) if blocking and timeout is not None else None
+    while True:
+        try:
+            _win_byte_lock(fd, msvcrt.LK_NBLCK)
+            return
+        except OSError as exc:
+            if not _is_windows_contention(exc):
+                raise
+            if not blocking or (deadline is not None and time.monotonic() >= deadline):
+                raise LockBusy("file lock busy") from exc
+            time.sleep(_PLATFORM_LOCK_POLL_SECONDS)
+
+
+def _os_release(fd: int) -> None:
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return
+    import msvcrt
+
+    try:
+        _win_byte_lock(fd, msvcrt.LK_UNLCK)
+    except OSError:
+        pass
+
+
+def _lock_file_identity(fd: int) -> tuple[int, int] | None:
+    """当前 fd 的文件身份 ``(st_dev, st_ino)``。fd 已关闭或无效时返回 None。"""
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _holds_same_file(
+    current: tuple[int, int, int, int] | None,
+    me: int,
+    identity: tuple[int, int] | None,
+) -> bool:
+    """重入以 (线程, 文件身份) 判定。身份缺失或 dev/ino 不同都不是重入。"""
+    return (
+        current is not None
+        and identity is not None
+        and current[0] == me
+        and (current[2], current[3]) == identity
+    )
+
+
+def _acquire_platform_lock(fd: int, *, blocking: bool, timeout: float | None) -> None:
+    me = threading.get_ident()
+    identity = _lock_file_identity(fd)
+    with _LOCK_REFS_GUARD:
+        current = _LOCK_REFS.get(fd)
+        if _holds_same_file(current, me, identity) and current is not None and identity is not None:
+            _LOCK_REFS[fd] = (me, current[1] + 1, identity[0], identity[1])
+            return
+        # fstat 失败，或 fd 号已指向另一个文件：旧条目过期。丢掉后再走操作系统锁。
+        if current is not None and (
+            identity is None or (current[2], current[3]) != identity
+        ):
+            _LOCK_REFS.pop(fd, None)
+    _os_acquire(fd, blocking=blocking, timeout=timeout)
+    if identity is None:
+        identity = _lock_file_identity(fd)
+    with _LOCK_REFS_GUARD:
+        current = _LOCK_REFS.get(fd)
+        if _holds_same_file(current, me, identity) and current is not None and identity is not None:
+            _LOCK_REFS[fd] = (me, current[1] + 1, identity[0], identity[1])
+        elif identity is not None:
+            _LOCK_REFS[fd] = (me, 1, identity[0], identity[1])
+        else:
+            _LOCK_REFS.pop(fd, None)
+
+
+def _release_platform_lock(fd: int) -> None:
+    """配对释放。身份对不上时当作没有条目，不减过期计数，并保守释放当前 fd。
+
+    同一文件仍由别的线程持有时不释放，避免把那个线程的锁解掉。
+    """
+    me = threading.get_ident()
+    identity = _lock_file_identity(fd)
+    unlock = False
+    with _LOCK_REFS_GUARD:
+        current = _LOCK_REFS.get(fd)
+        if current is None:
+            unlock = True
+        elif _holds_same_file(current, me, identity) and current is not None and identity is not None:
+            if current[1] > 1:
+                _LOCK_REFS[fd] = (me, current[1] - 1, identity[0], identity[1])
+                return
+            _LOCK_REFS.pop(fd, None)
+            unlock = True
+        elif identity is None or (current[2], current[3]) != identity:
+            _LOCK_REFS.pop(fd, None)
+            unlock = True
+    if unlock:
+        _os_release(fd)
+
+
+@contextmanager
+def platform_lock(fd: int, *, blocking: bool = True) -> Iterator[None]:
+    """对已打开的 fd 加排他锁。退出时释放。
+
+    POSIX：``flock(LOCK_EX)``；``blocking=False`` 时加 ``LOCK_NB``。
+    Windows：只对首字节循环 ``msvcrt.locking(LK_NBLCK)``，间隔 0.2s。
+    ``blocking=False`` 竞争失败抛 :class:`LockBusy`。
+    重入以 (线程, 文件身份) 判定，不重复打操作系统锁。
+    """
+    _acquire_platform_lock(fd, blocking=blocking, timeout=None)
+    try:
+        yield
+    finally:
+        _release_platform_lock(fd)
+
+
+def try_platform_lock(fd: int) -> bool:
+    """非阻塞加锁。成功返回 True 且当前线程持有锁；竞争返回 False，不抛 LockBusy。
+
+    重入以 (线程, 文件身份) 判定。成功后须在同一线程释放（:func:`_release_platform_lock`，或外层尚未持有时用
+    :func:`platform_lock` 包住临界区）。不要在已持有后再进出一次 ``platform_lock``
+    来释放：那只是重入计数加一减一，操作系统锁还在。
+    """
+    try:
+        _acquire_platform_lock(fd, blocking=False, timeout=None)
+    except LockBusy:
+        return False
+    return True
+
+
+@contextmanager
+def locked_path(
+    path: Path, *, blocking: bool = True, timeout: float | None = None
+) -> Iterator[None]:
+    """打开或创建 ``path``，对 fd 加排他锁，退出时释放并关闭。
+
+    ``blocking=True`` 且 ``timeout=None`` 与 ``flock(LOCK_EX)`` 一样一直等待。
+    ``timeout`` 到期抛 :class:`LockBusy`。Windows 轮询间隔 0.2s，不用会自行放弃的阻塞 locking。
+    """
+    target = Path(path)
+    parent = target.parent
+    if str(parent) not in ("", "."):
+        parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(str(target), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if blocking:
+            _acquire_platform_lock(descriptor, blocking=True, timeout=timeout)
+        else:
+            _acquire_platform_lock(descriptor, blocking=False, timeout=None)
+        try:
+            yield
+        finally:
+            _release_platform_lock(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -39,11 +284,8 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
     lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     os.chmod(lock_path, 0o600)
     with os.fdopen(lock_descriptor, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
+        with platform_lock(lock_file.fileno()):
             yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +297,7 @@ def exclusive_file_lock(path: Path) -> Iterator[None]:
 #   NFS 把 flock 转成需写打开的 fcntl 锁），后备链无法证明与目录锁持有者互斥。因此：
 #   * 事务命令与 ONES 远端建单认领（``required=True``）取不到目录锁即**失败关闭**（``FlowStatusLockUnavailable``），
 #     不尝试后备链；
-#   * 单步本地写（``required=False``）按 R-24 退到后备链：按固定顺序 主 ``~/.devkit/locks/flow-status`` → 私有回退
+#   * 单步本地写（``required=False``）按 R-24 退到后备链：按固定顺序 主 ``~/.config/devkit/locks/flow-status`` → 私有回退
 #     ``<gettempdir()>/devkit-flow-locks-<uid>``，对**所有可达**目录逐一加锁（D-51①；``DEVKIT_FLOW_LOCK_ROOT``
 #     非空时只用该目录，仅测试隔离用），并在 stderr 告警一行——即使后备链全部取得也告警，因为此时无法证明与目录锁
 #     持有者互斥（单步互斥在这一极端情形不保证）。
@@ -99,7 +341,7 @@ def _flow_status_lock_root_label(position: int) -> str:
     """后备锁目录的无路径标签（N3-3）。"""
     if os.environ.get(FLOW_STATUS_LOCK_ROOT_ENV, "").strip():
         return FLOW_STATUS_LOCK_ROOT_ENV
-    return "主后备锁目录(~/.devkit/locks)" if position == 0 else "回退锁目录(系统临时目录)"
+    return "主后备锁目录(~/.config/devkit/locks)" if position == 0 else "回退锁目录(系统临时目录)"
 
 
 def flow_status_lock_roots() -> list[Path]:
@@ -157,7 +399,7 @@ def _open_flow_status_lock_file(root: Path, digest: str) -> int:
 def _close_quietly(descriptor: int, *, unlock: bool) -> None:
     if unlock:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _release_platform_lock(descriptor)
         except Exception:
             pass
     try:
@@ -167,15 +409,15 @@ def _close_quietly(descriptor: int, *, unlock: bool) -> None:
 
 
 def _flock_with_deadline(descriptor: int, path: Path, timeout: float | None, deadline: float | None) -> None:
-    """竞争 → 等待/超时（FlowStatusLockTimeout）；flock 本身失败按原异常抛出（调用方视为不受支持/不可达）。"""
+    """竞争 → 等待/超时（FlowStatusLockTimeout）；加锁本身失败按原异常抛出（调用方视为不受支持/不可达）。"""
     if deadline is None:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_platform_lock(descriptor, blocking=True, timeout=None)
         return
     while True:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _acquire_platform_lock(descriptor, blocking=False, timeout=None)
             return
-        except BlockingIOError:
+        except LockBusy:
             if time.monotonic() >= deadline:
                 raise FlowStatusLockTimeout(
                     f"{timeout:g}s 内未取得 {path.name} 写锁（他人正在写入），请稍后重试。"
@@ -703,7 +945,7 @@ def maybe_check_latest_update(ttl_hours: float = 4) -> dict[str, Any] | None:
     """检查是否有新版本 devkit-flow（npm 通道）；任何失败都静默返回 None，绝不打断主命令。
 
     - 远端版本探测走 npm view；npm 不在 PATH 或查询失败时返回 None。
-    - 结果缓存 ~/.devkit/latest-check.json：距上次检查 < ttl_hours 直接读缓存，不访问网络；
+    - 结果缓存 ~/.config/devkit/latest-check.json：距上次检查 < ttl_hours 直接读缓存，不访问网络；
       失败同样写入失败时间戳（latest 为 null），避免每次命令都重复打网络。
     """
     cache_path = latest_check_cache_path()
@@ -746,3 +988,529 @@ def emit_update_notice(update: dict[str, Any] | None, output_format: str) -> Non
         f"发现新版本 devkit-flow {update['latest']}（当前 {update['current']}），"
         "可执行 devkit-flow self-update 升级。"
     )
+
+
+def process_alive(pid: object) -> bool | None:
+    """进程是否仍在。True = 存在或无权限，False = 已证明不存在，None = 无法判定。
+
+    POSIX 用 ``os.kill(pid, 0)``。Windows 用 ``OpenProcess`` + ``GetExitCodeProcess``，
+    且绝不调用 ``os.kill``（``0`` 在 nt 上是 ``CTRL_C_EVENT``）。导入本模块不会探测进程。
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name == "nt":
+        return _process_alive_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _process_alive_windows(pid: int) -> bool | None:
+    """仅 nt 调用。``use_last_error=True``，句柄 restype 为 ``HANDLE``，避免 64 位截断。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            code = ctypes.get_last_error()
+            if code == 87:
+                return False
+            if code == 5:
+                return True
+            return None
+        try:
+            status = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(status)):
+                return None
+            return status.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def truncate_keep_tail(
+    path: Path | str,
+    max_bytes: int,
+    keep_bytes: int,
+    marker: str,
+) -> dict[str, int] | None:
+    """原地保留日志尾部。不改名、不换 inode。未超阈值返回 None。
+
+    ``marker`` 里的 ``{dropped}`` 会换成丢弃字节数。失败抛 ``OSError``，由调用方记 PRV-025。
+    """
+    target = Path(path)
+    try:
+        size = target.stat().st_size
+    except OSError:
+        raise
+    if not target.is_file() or size <= max_bytes:
+        return None
+    if type(max_bytes) is not int or type(keep_bytes) is not int or keep_bytes < 0:
+        return None
+    with exclusive_file_lock(target):
+        size = target.stat().st_size
+        if size <= max_bytes:
+            return None
+        keep = min(keep_bytes, size)
+        start = size - keep
+        with open(target, "r+b") as handle:
+            window = min(PR_REVIEW_LOG_ALIGN_BYTES, start)
+            if window:
+                handle.seek(start - window)
+                prefix = handle.read(window)
+                newline = prefix.rfind(b"\n")
+                if newline >= 0:
+                    start = start - window + newline + 1
+            handle.seek(start)
+            tail = handle.read()
+            dropped = start
+            text = marker.replace("{dropped}", str(dropped)) if "{dropped}" in marker else marker
+            if not text.endswith("\n"):
+                text += "\n"
+            body = text.encode("utf-8") + tail
+            handle.seek(0)
+            handle.write(body)
+            handle.truncate(len(body))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return {"sizeBefore": size, "sizeAfter": len(body), "kept": len(tail), "dropped": dropped}
+
+
+# Win32 进程与派生标志。数值写死，避免在 POSIX 上读取 subprocess 没有的属性。
+_WIN_DETACHED_PROCESS = 0x00000008
+_WIN_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_WIN_CREATE_NO_WINDOW = 0x08000000
+_WIN_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_TH32CS_SNAPPROCESS = 0x00000002
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_INVALID_WIN_HANDLES = frozenset({0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF})
+# FILETIME 从 1601-01-01 UTC 起算，与 Unix epoch 相差的秒数。
+_FILETIME_UNIX_DELTA = 11644473600
+_PS_PARENT_TIMEOUT_SEC = 2
+_PS_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+
+
+def _invalid_win_handle(handle: object) -> bool:
+    if not handle:
+        return True
+    try:
+        value = int(handle)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return True
+    return value in _INVALID_WIN_HANDLES
+
+
+def _parse_ps_ppid_comm(stdout: str) -> tuple[int, str] | None:
+    line = ""
+    for raw in stdout.splitlines():
+        stripped = raw.strip()
+        if stripped:
+            line = stripped
+            break
+    if not line:
+        return None
+    parts = line.split(None, 1)
+    if len(parts) != 2:
+        return None
+    try:
+        ppid = int(parts[0])
+    except ValueError:
+        return None
+    name = parts[1].strip()
+    if not name:
+        return None
+    return ppid, name
+
+
+def _parse_ps_lstart(stdout: str) -> str | None:
+    """``ps -o lstart=`` 的本地墙钟，收成不带偏移的 ISO-8601。
+
+    字符串只由 ps 输出决定，同一 pid 两次读取可比，用来识别 pid 复用。
+    """
+    cleaned = " ".join(stdout.split())
+    if not cleaned:
+        return None
+    try:
+        parsed = datetime.strptime(cleaned, _PS_LSTART_FORMAT)
+    except ValueError:
+        return None
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _ps_ppid_comm(pid: int) -> tuple[int, str] | None:
+    try:
+        result = run_external(
+            ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+            check=False,
+            timeout=_PS_PARENT_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_ps_ppid_comm(result.stdout or "")
+
+
+def _walk_parent_rows(
+    rows: dict[int, tuple[int, str]],
+    pid: int,
+    depth: int,
+) -> list[tuple[int, int, str]]:
+    chain: list[tuple[int, int, str]] = []
+    current = pid
+    seen: set[int] = set()
+    for _ in range(depth):
+        if current in seen or current not in rows:
+            break
+        seen.add(current)
+        ppid, name = rows[current]
+        chain.append((current, ppid, name))
+        if ppid <= 0 or ppid == current:
+            break
+        current = ppid
+    return chain
+
+
+def _parent_pid_chain_posix(pid: int, depth: int) -> list[tuple[int, int, str]]:
+    chain: list[tuple[int, int, str]] = []
+    current = pid
+    seen: set[int] = set()
+    for _ in range(depth):
+        if current in seen or current <= 0:
+            break
+        seen.add(current)
+        parsed = _ps_ppid_comm(current)
+        if parsed is None:
+            break
+        ppid, name = parsed
+        chain.append((current, ppid, name))
+        if ppid <= 0 or ppid == current:
+            break
+        current = ppid
+    return chain
+
+
+def _parent_pid_chain_nt(pid: int, depth: int) -> list[tuple[int, int, str]]:
+    """一次进程快照后在内存里向上走。失败时返回已经能解析出的前缀。"""
+    rows: dict[int, tuple[int, str]] = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if _invalid_win_handle(snapshot):
+            return []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                text = str(entry.szExeFile).split("\x00", 1)[0].strip()
+                rows[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), text)
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except Exception:
+        return _walk_parent_rows(rows, pid, depth)
+    return _walk_parent_rows(rows, pid, depth)
+
+
+def parent_pid_chain(pid: object, depth: object) -> list[tuple[int, int, str]]:
+    """从 ``pid`` 向上的进程链，最多 ``depth`` 项，每项 ``(pid, ppid, name)``。
+
+    POSIX 用 ``ps -o ppid=,comm= -p``（``run_external``，超时 2 秒）。
+    nt 用 ``CreateToolhelp32Snapshot`` + ``Process32FirstW`` / ``Process32NextW``。
+    中途失败返回已经取得的前缀，不抛出。非法 pid 或 depth 返回空列表。
+    """
+    if type(pid) is not int or pid <= 0:
+        return []
+    if type(depth) is not int or depth <= 0:
+        return []
+    if os.name == "nt":
+        return _parent_pid_chain_nt(pid, depth)
+    return _parent_pid_chain_posix(pid, depth)
+
+
+def _filetime_to_iso(high: int, low: int) -> str | None:
+    ticks = (int(high) << 32) | (int(low) & 0xFFFFFFFF)
+    if ticks <= 0:
+        return None
+    unix = (ticks // 10_000_000) - _FILETIME_UNIX_DELTA
+    if unix < 0:
+        return None
+    moment = datetime.fromtimestamp(unix, tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _process_start_time_kernel(pid: int) -> str | None:
+    """macOS ``proc_pidinfo(PROC_PIDTBSDINFO)`` 的 ``pbi_start_tvsec``，本地墙钟、秒精度。
+
+    布局与 xnu ``proc_bsdinfo`` 一致（到 ``pbi_start_tvusec`` 为止 136 字节）。取不到返回 None，
+    调用方再退回 ``ps``。不发起子进程。
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class _ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        libc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libc.proc_pidinfo.restype = ctypes.c_int
+        info = _ProcBsdInfo()
+        written = libc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if written < ctypes.sizeof(info):
+            return None
+        tvsec = int(info.pbi_start_tvsec)
+        if tvsec <= 0:
+            return None
+        return datetime.fromtimestamp(tvsec).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def _process_start_time_posix(pid: int) -> str | None:
+    kernel = _process_start_time_kernel(pid)
+    if kernel is not None:
+        return kernel
+    try:
+        result = run_external(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            timeout=_PS_PARENT_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_ps_lstart(result.stdout or "")
+
+
+def _process_start_time_nt(pid: int) -> str | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if _invalid_win_handle(handle):
+            return None
+        try:
+            created = FILETIME()
+            exited = FILETIME()
+            kernel_time = FILETIME()
+            user_time = FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None
+            return _filetime_to_iso(int(created.dwHighDateTime), int(created.dwLowDateTime))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def process_start_time(pid: object) -> str | None:
+    """进程启动时间。取不到返回 None，不抛出。
+
+    POSIX：先读内核启动时间（macOS ``proc_pidinfo``），失败再 ``ps -o lstart=``，都收成
+    ISO-8601 本地墙钟。nt：``GetProcessTimes`` 收成 UTC ``Z``。
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name == "nt":
+        return _process_start_time_nt(pid)
+    return _process_start_time_posix(pid)
+
+
+def _spawn_command(argv: object) -> list[str] | None:
+    if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)):
+        return None
+    if not argv:
+        return None
+    command: list[str] = []
+    for part in argv:
+        if part is None:
+            return None
+        text = str(part)
+        if not text:
+            return None
+        command.append(text)
+    return command
+
+
+def _spawn_detached_windows(command: list[str], log_file: object) -> None:
+    """nt：脱离作业、新进程组、无窗口。breakaway 被拒时去掉该标志再试一次。"""
+    # 按位或放在函数内：模块级 ``Name | Name`` 会被 3.9 守卫当成类型联合。
+    flags = (
+        _WIN_DETACHED_PROCESS
+        | _WIN_CREATE_NEW_PROCESS_GROUP
+        | _WIN_CREATE_NO_WINDOW
+        | _WIN_CREATE_BREAKAWAY_FROM_JOB
+    )
+    shared = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": log_file,
+        "close_fds": True,
+    }
+    try:
+        subprocess.Popen(command, creationflags=flags, **shared)
+    except OSError:
+        subprocess.Popen(command, creationflags=flags & ~_WIN_CREATE_BREAKAWAY_FROM_JOB, **shared)
+
+
+def spawn_detached(argv: object, log_path: object) -> bool:
+    """派生独立进程，stdout / stderr 追加写入日志。成功 True，失败 False，不抛出。
+
+    调用方用返回值把派生失败记入 ``errors[]``。日志父目录不存在视为失败。
+    """
+    command = _spawn_command(argv)
+    if command is None:
+        return False
+    try:
+        log_file = open(os.fspath(log_path), "ab")  # type: ignore[arg-type]
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        if os.name != "nt":
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=log_file,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True
+        _spawn_detached_windows(command, log_file)
+        return True
+    except Exception:
+        return False
+    finally:
+        log_file.close()
+
+
+def devkit_flow_argv(*args: object) -> list[str]:
+    """重新拉起本 CLI 的 argv。三态 argv0 的唯一实现，``self_command`` 只做包装：
+
+    1. argv0 是已存在的 ``devkit-flow`` / ``cli.py`` / ``__main__.py`` → ``[python, 绝对路径, *args]``
+    2. 其余（测试进程、找不到入口文件）→ ``python -c`` 导入 ``devkit_flow.cli``
+    """
+    arguments = [str(item) for item in args]
+    argv0 = str(sys.argv[0] or "")
+    candidate = Path(argv0) if argv0 else None
+    if (
+        candidate is not None
+        and candidate.is_file()
+        and (candidate.name == "devkit-flow" or candidate.name in {"cli.py", "__main__.py"})
+    ):
+        return [sys.executable, str(candidate.resolve()), *arguments]
+    literal = json.dumps(arguments)
+    return [
+        sys.executable,
+        "-c",
+        "import sys; from devkit_flow.cli import main; "
+        f"sys.argv = ['devkit-flow', *{literal}]; "
+        "raise SystemExit(main())",
+    ]

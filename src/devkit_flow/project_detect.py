@@ -2267,7 +2267,7 @@ def _pd_cache_shape_ok(data: dict[str, Any]) -> bool:
 
 
 class ProfileCache:
-    """画像缓存 ``~/.devkit/cache/project-profiles/<sha256(realpath)[:16]>.json``（接口 §8.2）。
+    """画像缓存 ``~/.config/devkit/cache/project-profiles/<sha256(realpath)[:16]>.json``（接口 §8.2）。
 
     ``read`` / ``quickState`` 对缺失、不可读、非 JSON、版本不符、结构不合法、耗尽画像一律按「无缓存」处理，
     从不抛出（接口 §9.3）。

@@ -3,11 +3,37 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
+from devkit_flow.constants import PR_REVIEW_ERROR_EXIT
+
+
+_PR_REVIEW_EXIT_CODES = frozenset({0, 1, 2, 3, 4, 124})
+
 
 class DevkitFlowError(RuntimeError):
     def __init__(self, *args: object, error_code: str | None = None, **kwargs: object):
         super().__init__(*args, **kwargs)
         self.error_code = error_code
+
+
+class PrReviewExit(DevkitFlowError):
+    """pr-review 失败。``exit_code`` 由 ``pr_review_cmd._guarded`` 返回，不改 ``cli.py``（DR-40）。
+
+    省略 ``exit_code`` 时取 ``PR_REVIEW_ERROR_EXIT`` 的典型退出码，未知码默认为 1。
+    允许 0：PRV-015 / PRV-024 / PRV-007 的「只记录」路径不是进程失败，但仍可能携带错误码。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *args: object,
+        error_code: str,
+        exit_code: int | None = None,
+    ) -> None:
+        resolved = PR_REVIEW_ERROR_EXIT.get(error_code, 1) if exit_code is None else exit_code
+        if resolved not in _PR_REVIEW_EXIT_CODES:
+            raise ValueError(f"unsupported pr-review exit code: {resolved}")
+        super().__init__(message, *args, error_code=error_code)
+        self.exit_code = resolved
 
 
 class ExternalCommandError(DevkitFlowError):

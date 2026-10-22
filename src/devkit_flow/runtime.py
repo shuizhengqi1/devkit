@@ -19,8 +19,74 @@ from devkit_flow.constants import AGENT_DATA_PAYLOAD_FILES, CANONICAL_RUNTIME_OR
 from devkit_flow.errors import DevkitFlowError
 from devkit_flow.kimi_plugin import install_kimi_plugin, parse_agent_source, replace_directory
 from devkit_flow.models import WorkflowRuntimeSwitch
+from devkit_flow.constants import PR_REVIEW_WATCH_HOOK_LOCK_TIMEOUT_MS, PR_REVIEW_WATCH_SESSION_ENV_VARS
+class _PublicWatchResult:
+    status = "done"
+    removed = 0
+    rendered = ""
+    reservedSeq = 0
+    queueId = ""
+
+
+class WatchRegistry:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+class WatchService:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def deregister_session(self, *args: Any, **kwargs: Any) -> _PublicWatchResult:
+        return _PublicWatchResult()
+
+    def next_turn_inject(self, *args: Any, **kwargs: Any) -> _PublicWatchResult:
+        return _PublicWatchResult()
+
+    def confirm_turn_inject(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def apply_pr_review_session_start_notice(parts: list[str], *args: Any, **kwargs: Any) -> list[str]:
+    del args, kwargs
+    return parts
+
+
+def pr_review_auth_notice(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
+
+
+def pr_review_session_line(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
+
+
+def detached_converge_allows_unload(*args: Any, **kwargs: Any) -> bool:
+    del args, kwargs
+    return False
+
+
+def forget_pending_session_end(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
+
+
+def remember_pending_session_end(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
+
+
+def replay_pending_session_ends(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
+
+
+def resume_ended_watches(*args: Any, **kwargs: Any) -> None:
+    del args, kwargs
+    return None
 from devkit_flow.selfupdate import extract_embedded_version, find_global_cli, self_update_result
-from devkit_flow.session_registry import append_session_marker, iter_markers, latest_marker, parse_hook_stdin, read_hook_stdin
+from devkit_flow.session_registry import SessionEndIdentity, SessionIndex, SessionIndexReadError, SessionRef, append_session_end, append_session_marker, capture_session_end_identity, iter_markers, latest_marker, parse_hook_stdin, read_hook_stdin, registry_path, resolve_runtime_pid, sid_key
 from devkit_flow.setup import resolve_agents_source, stale_codex_plugin_finding
 from devkit_flow.telemetry import TelemetryConfig, TelemetryEmitter, session_ended_extended_stats
 from devkit_flow.telemetry_spans import (
@@ -31,7 +97,7 @@ from devkit_flow.telemetry_spans import (
     SessionTokenSummarizer,
 )
 from devkit_flow.templates_md import LEGACY_WORKSPACE_ROUTING_TEMPLATE, PRE_WORKFLOW_LEGACY_WORKSPACE_ROUTING_TEMPLATE, WORKSPACE_ROUTING_TEMPLATE
-from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, maybe_check_latest_update, runtime_support_root, sha256_file, version_tuple
+from devkit_flow.textio import atomic_write_text, compact_error, current_cli_path, emit, maybe_check_latest_update, process_start_time, runtime_support_root, sha256_file, spawn_detached, version_tuple
 from devkit_flow.version import NPM_PACKAGE_NAME, VERSION
 from devkit_flow.workflow_auto import merge_auto_takeover, workflow_session_notice_line
 
@@ -351,9 +417,336 @@ def session_freshness_notice(runtime: str, check: dict[str, Any]) -> str | None:
     return f"[devkit] update: {'; '.join(bits)}; run: {command}"
 
 
+_HOOK_LOCK_SEC = PR_REVIEW_WATCH_HOOK_LOCK_TIMEOUT_MS / 1000.0
+_CLEAR_WINDOW_SEC = 120
+# /clear 已注销监听，marker 只留条数。converge 不会按原目标恢复。
+# 引号包住占位，shell 不会把 < 当重定向、把 # 当注释；cliargs 仍能解析。
+_CLEAR_RESTART_COMMAND = "devkit-flow pr-review watch start --lane author --pr '<project>/<repo>#<id>'"
+_CLEAR_HINT = (
+    "[devkit] pr-review: /clear 结束了上一会话的 %d 条 PR 监听，"
+    "如需继续请按原目标重新执行 " + _CLEAR_RESTART_COMMAND
+)
+_PLAIN_TURN_RUNTIMES = ("kimi-code", "pi")
+
+
+class _HookTimer:
+    """SessionEnd 不调用定时器。占位对象避免 hook 构造真实 launchd / schtasks。"""
+
+    def backend(self) -> str:
+        if os.name == "nt":
+            return "schtasks"
+        return "launchd"
+
+
+def _hook_platform() -> str:
+    if os.name == "nt":
+        return "nt"
+    if sys.platform == "darwin":
+        return "darwin"
+    return str(sys.platform)
+
+
+def _hook_spawn(argv: object, log_path: object) -> bool:
+    """开关允许时才派生卸载。不等待子进程（spawn_detached 自己返回）。"""
+    if not detached_converge_allows_unload(_hook_platform()):
+        return False
+    return bool(spawn_detached(argv, log_path))
+
+
+def _hook_watch_service_at(home: Path) -> WatchService:
+    index = SessionIndex(home=home)
+    registry = WatchRegistry(home / ".devkit" / "review", session_index=index)
+    return WatchService(
+        registry,
+        _HookTimer(),
+        platform=_hook_platform(),
+        spawn=_hook_spawn,
+        session_index=index,
+        home=home,
+    )
+
+
+def _hook_watch_service() -> WatchService:
+    return _hook_watch_service_at(Path.home())
+
+
+def _review_root() -> Path:
+    return Path.home() / ".config" / "devkit" / "review"
+
+
+def _hook_stdin_source(raw: str) -> str | None:
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    source = data.get("source")
+    if isinstance(source, str) and source.strip():
+        return source.strip()
+    return None
+
+
+def _clear_restart_hint(runtime: str, pid: int | None, current_session: str | None) -> str | None:
+    """同 pid 上一会话 120s 内因 clear 结束且注销过监听时返回 DR-48 提示。"""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    index = SessionIndex(home=Path.home())
+    try:
+        document = json.loads(index.path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    sessions = document.get("sessions") if isinstance(document, dict) else None
+    if not isinstance(sessions, dict):
+        return None
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    best_sid = None
+    best_ended = None
+    prefix = str(runtime) + ":"
+    for key, raw in sessions.items():
+        if not str(key).startswith(prefix) or not isinstance(raw, dict):
+            continue
+        session_id = str(key).split(":", 1)[1]
+        if current_session and session_id == current_session:
+            continue
+        if raw.get("pid") != pid or raw.get("endReason") != "clear":
+            continue
+        ended = _parse_marker_ts(raw.get("endedAt"))
+        if ended is None:
+            continue
+        if (now - ended).total_seconds() > _CLEAR_WINDOW_SEC:
+            continue
+        if best_ended is None or ended > best_ended:
+            best_ended = ended
+            best_sid = session_id
+    if not best_sid:
+        return None
+    count = 0
+    for marker in iter_markers(home=Path.home()):
+        if marker.get("event") != "end":
+            continue
+        if marker.get("runtime") != runtime or marker.get("session_id") != best_sid:
+            continue
+        removed = marker.get("deregisteredWatches")
+        if type(removed) is int and removed > count:
+            count = removed
+    if count <= 0:
+        return None
+    return _CLEAR_HINT % count
+
+
+def _global_prompt(workspace: Path, clear_hint: str | None, session_line: str | None) -> str:
+    parts: list[str] = []
+    try:
+        notice = pr_review_auth_notice(_review_root())
+    except Exception:
+        notice = None
+    if notice:
+        parts.append(notice)
+    if clear_hint:
+        parts.append(clear_hint)
+    if session_line:
+        parts.append(session_line)
+    return "; ".join(parts)
+
+
+def _write_claude_inbox(runtime: str, session_id: str, pid: int | None) -> None:
+    """token 只进 0600 inbox 文件，不进索引、登记表或日志。"""
+    if runtime != "claude-code" or not session_id:
+        return
+    socket = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", "").strip()
+    token = os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN", "").strip()
+    if not socket or not token:
+        return
+    path = Path.home() / ".config" / "devkit" / "sessions" / "claude-code" / ("%s.inbox.json" % sid_key(session_id))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schemaVersion": 1, "socket": socket, "token": token, "pid": pid}
+    data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, data)
+    finally:
+        os.close(descriptor)
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+
+
+def _annotate_deregistered(home: Path, count: int) -> None:
+    path = registry_path(home)
+    if not path.is_file():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return
+    try:
+        row = json.loads(lines[-1])
+    except ValueError:
+        return
+    if not isinstance(row, dict) or row.get("event") != "end":
+        return
+    row["deregisteredWatches"] = int(count)
+    lines[-1] = json.dumps(row, ensure_ascii=False)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _finalize_session_end(
+    runtime: str,
+    workspace: Path,
+    session_id: str | None,
+    reason: str | None,
+    identity: SessionEndIdentity | None = None,
+) -> None:
+    """只用入口捕获的身份写结束标记和注销。这里不再读索引补身份。"""
+    if not isinstance(identity, SessionEndIdentity):
+        return
+    session_id = identity.session_id or session_id
+    if not session_id:
+        return
+    home = Path.home()
+    end_reason = reason if isinstance(reason, str) else ""
+    if identity.state == "unreadable":
+        remember_pending_session_end(home, runtime, session_id, end_reason, captured=identity)
+        return
+    outcome: dict[str, Any] = {}
+    indexed = SessionIndex(home=home).record_end(
+        runtime,
+        session_id,
+        end_reason,
+        identity.observed_at,
+        lock_timeout=_HOOK_LOCK_SEC,
+        expected_identity=identity,
+        outcome=outcome,
+    )
+    status = outcome.get("status")
+    if indexed is None and status not in ("rejected", "deferred"):
+        status = "failed"
+    if status == "rejected":
+        forget_pending_session_end(home, runtime, session_id, identity)
+        return
+    if status != "applied":
+        if status != "deferred":
+            append_session_end(
+                runtime=runtime,
+                workspace=workspace,
+                session_id=session_id,
+                reason=end_reason,
+                home=home,
+            )
+        remember_pending_session_end(home, runtime, session_id, end_reason, captured=identity)
+        return
+    append_session_end(
+        runtime=runtime,
+        workspace=workspace,
+        session_id=session_id,
+        reason=end_reason,
+        home=home,
+    )
+    generation = outcome.get("generation")
+    if type(generation) is not int and indexed is not None and type(indexed.generation) is int:
+        generation = indexed.generation
+    removed = 0
+    deregister_done = False
+    try:
+        result = _hook_watch_service().deregister_session(runtime, session_id, True, generation, identity)
+        deregister_done = getattr(result, "status", "") == "done"
+        if deregister_done:
+            removed = int(getattr(result, "removed", 0) or 0)
+    except Exception:
+        removed = 0
+        deregister_done = False
+    if not deregister_done:
+        remember_pending_session_end(home, runtime, session_id, end_reason, captured=identity)
+    else:
+        forget_pending_session_end(home, runtime, session_id, identity)
+    if removed > 0:
+        _annotate_deregistered(home, removed)
+
+
+def _hook_session_id(runtime: str) -> str | None:
+    parsed = parse_hook_stdin(read_hook_stdin())
+    session_id = parsed.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    for name, variable in PR_REVIEW_WATCH_SESSION_ENV_VARS:
+        if name != runtime:
+            continue
+        value = os.environ.get(variable, "").strip()
+        return value or None
+    return None
+
+
+def _collect_turn_start_injection(runtime: str) -> tuple:
+    """取出待注入文本。游标要等 stdout flush 成功后才确认。"""
+
+    session_id = _hook_session_id(runtime) or ""
+    if not session_id:
+        return "", 0, "", "", ""
+    result = _hook_watch_service().next_turn_inject(runtime, session_id)
+    rendered = getattr(result, "rendered", "") or ""
+    if not isinstance(rendered, str):
+        rendered = ""
+    seq = getattr(result, "reservedSeq", 0) or 0
+    try:
+        seq = int(seq)
+    except (TypeError, ValueError):
+        seq = 0
+    queue_id = str(getattr(result, "queueId", "") or "")
+    reservation_id = str(getattr(result, "reservationId", "") or "")
+    return rendered, seq, session_id, queue_id, reservation_id
+
+
+def _collect_turn_start_text(runtime: str) -> str:
+    text, _seq, _session_id, _queue_id, _reservation_id = _collect_turn_start_injection(runtime)
+    return text
+
+
+def turn_start_envelope(runtime: str, text: str) -> "dict[str, Any] | str | None":
+    """有事件时的信封。无事件：antigravity 为 {}，其余返回 None（调用方不输出）。"""
+    if runtime == "antigravity":
+        if not text:
+            return {}
+        return {"injectSteps": [{"userMessage": text}]}
+    if not text:
+        return None
+    if runtime in _PLAIN_TURN_RUNTIMES:
+        return text
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }
+
+
+def _emit_turn_start(runtime: str, text: str, hook_json: bool) -> None:
+    if runtime == "grok-build" and not hook_json:
+        if text:
+            print(text)
+            sys.stdout.flush()
+        return
+    rendered = turn_start_envelope(runtime, text)
+    if rendered is None:
+        return
+    if isinstance(rendered, str):
+        print(rendered)
+    else:
+        print(json.dumps(rendered, ensure_ascii=False))
+    sys.stdout.flush()
+
+
+def _print_check_failure(runtime: str) -> None:
+    """hook 内部异常：该端无事件输出，退出码由调用方保持 0。"""
+    if runtime == "antigravity":
+        print("{}")
+
+
 def runtime_hook_envelope(
     check: dict[str, Any],
     workspace: Path | None = None,
+    hook_event: str | None = None,
+    clear_hint: str | None = None,
 ) -> dict[str, Any]:
     runtime = str(check.get("runtime") or "unknown")
     root = workspace
@@ -390,6 +783,9 @@ def runtime_hook_envelope(
     if read_failed:
         parts.append("config-read-failed")
     parts.append(f"[devkit] {runtime} plugin {state}: {message}")
+    session_line = pr_review_session_line(root)
+    if session_line:
+        parts.append(session_line)
     if runtime == "codex":
         parts.append(
             "spec-backed continuation is coordinated by the Codex main thread loading "
@@ -406,9 +802,19 @@ def runtime_hook_envelope(
         if stale_plugin is not None:
             parts.append(stale_plugin["hint"])
     if runtime == "antigravity":
-        return {
-            "decision": "allow",
-        }
+        if hook_event == "SessionStart":
+            message = _global_prompt(root, clear_hint, session_line)
+            if not message:
+                return {}
+            return {"injectSteps": [{"systemMessage": message}]}
+        return {"decision": "allow"}
+    try:
+        parts = apply_pr_review_session_start_notice(parts, _review_root())
+    except Exception:
+        pass
+    if clear_hint:
+        auth_first = bool(parts) and str(parts[0]).startswith("[devkit] pr-review: MCode")
+        parts.insert(1 if auth_first else 0, clear_hint)
     context = "; ".join(parts)
     return {
         "continue": True,
@@ -422,14 +828,15 @@ def runtime_hook_envelope(
 
 
 
-def record_hook_session_marker(runtime: str, workspace: Path) -> None:
-    """SessionStart hook 会话标记：stdin JSON 解析出会话标识后写入中央 session registry。
+def record_hook_session_marker(runtime: str, workspace: Path) -> str | None:
+    """SessionStart：jsonl marker、会话索引、claude inbox。返回 DR-48 提示或 None。
 
     fail-safe：任何异常静默，绝不影响 hook envelope 输出与 exit code；无 stdin 数据
-    （手工执行 runtime check / 宿主未注入）时不记录。
+    （手工执行 runtime check / 宿主未注入）时不记录。不取 tick.lock，不收敛。
     """
     try:
-        parsed = parse_hook_stdin(read_hook_stdin())
+        raw = read_hook_stdin()
+        parsed = parse_hook_stdin(raw)
         session_id = parsed["session_id"]
         if runtime == "grok-build" and not session_id:
             session_id = os.environ.get("GROK_SESSION_ID", "").strip() or None
@@ -437,14 +844,36 @@ def record_hook_session_marker(runtime: str, workspace: Path) -> None:
             session_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "").strip() or None
         transcript_path = parsed["transcript_path"]
         if not session_id and not transcript_path:
-            return
+            return None
+        from datetime import datetime, timezone
+
+        resolved = resolve_runtime_pid(runtime, os.environ)
+        hint = None
+        if _hook_stdin_source(raw) == "clear":
+            hint = _clear_restart_hint(runtime, resolved.pid, session_id)
         append_session_marker(
             runtime=runtime,
             workspace=workspace,
             session_id=session_id,
             transcript_path=transcript_path,
             source="hook-stdin",
+            pid=resolved.pid,
+            proc_started_at=resolved.proc_started_at,
         )
+        if session_id:
+            try:
+                written = SessionIndex(home=Path.home()).record_start(
+                    SessionRef(runtime, session_id, resolved.pid, str(workspace)),
+                    resolved.proc_started_at,
+                    "session-start",
+                    datetime.now(timezone.utc),
+                    lock_timeout=_HOOK_LOCK_SEC,
+                )
+                _write_claude_inbox(runtime, session_id, resolved.pid)
+                if written is not None:
+                    resume_ended_watches(Path.home(), runtime, session_id, True)
+            except Exception:
+                pass
         # 点位 #13：marker 落盘后 enqueue-only session_started（先落盘再 enqueue，
         # enqueue 抛错也不回滚 marker、不改 exit）。
         _emit_session_event(
@@ -458,14 +887,20 @@ def record_hook_session_marker(runtime: str, workspace: Path) -> None:
             {"name": runtime, "session_id": session_id},
             command="runtime check",
         )
+        return hint
     except Exception:
-        pass  # 兜底防线：marker / enqueue 失败绝不阻断 hook
+        return None  # 兜底防线：marker / enqueue 失败绝不阻断 hook
 
 
 def command_runtime_check(args: argparse.Namespace) -> int:
-    if getattr(args, "runtime", None) in CANONICAL_RUNTIME_ORDER:
-        record_hook_session_marker(args.runtime, Path(getattr(args, "target", ".") or "."))
-    if args.hook_json:
+    runtime = getattr(args, "runtime", None)
+    workspace = Path(getattr(args, "target", ".") or ".")
+    hint = None
+    if runtime in CANONICAL_RUNTIME_ORDER:
+        hint = record_hook_session_marker(runtime, workspace)
+    if not args.hook_json:
+        return command_runtime_lifecycle(args, "check")
+    try:
         if args.runtime == "all":
             raise DevkitFlowError("--hook-json requires a single runtime")
         buffer = io.StringIO()
@@ -495,9 +930,17 @@ def command_runtime_check(args: argparse.Namespace) -> int:
             ),
             "installed": child.get("installed"),
         }
-        print(json.dumps(runtime_hook_envelope(check), ensure_ascii=False))
+        envelope = runtime_hook_envelope(
+            check,
+            workspace,
+            hook_event=getattr(args, "hook_event", None),
+            clear_hint=hint,
+        )
+        print(json.dumps(envelope, ensure_ascii=False))
         return 0
-    return command_runtime_lifecycle(args, "check")
+    except Exception:
+        _print_check_failure(str(getattr(args, "runtime", "") or ""))
+        return 0
 
 
 def _emit_session_event(
@@ -549,15 +992,18 @@ CODEX_STOP_HOOK_OUTPUT_KEYS = frozenset(
 def _session_end_hook_envelope(
     hook_event: str = "SessionEnd",
     runtime: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """`--hook-json` session-end 的 stdout。按宿主 schema 出字段，不套用 Claude 协议。
 
     - claude-code SessionEnd：只有 continue / suppressOutput（D-45）。
     - claude-code Stop：允许 hookSpecificOutput。
     - codex Stop：0.153 禁止 hookSpecificOutput，多一个键就会 Hook failed。
+    - codex SessionEnd：stdout 为空（DR-25，返回 None，调用方不打印）。
     - kimi-code session-end 走 `--format json`（{status: ok}），不进本函数。
     - grok-build / pi 无 Stop/SessionEnd hook；未知 runtime 也不发 Claude 专用字段。
     """
+    if hook_event != "Stop" and runtime == "codex":
+        return None
     envelope: dict[str, Any] = {"continue": True, "suppressOutput": True}
     if hook_event == "Stop" and runtime == "claude-code":
         envelope["hookSpecificOutput"] = {
@@ -568,7 +1014,10 @@ def _session_end_hook_envelope(
 
 
 def _collect_session_ended(
-    runtime: str, workspace: Path, hook_event: str = "SessionEnd"
+    runtime: str,
+    workspace: Path,
+    hook_event: str = "SessionEnd",
+    explicit_session_id: str | None = None,
 ) -> None:
     """解析 stdin / 归因回落 / duration / tokens，enqueue-only 一条 session_ended。
 
@@ -584,118 +1033,144 @@ def _collect_session_ended(
     # 复用模块级 read_hook_stdin / parse_hook_stdin（保留 hook 测试对 runtime.* 的 mock 缝）。
     raw = read_hook_stdin()
     parsed = parse_hook_stdin(raw)
-    session_id = parsed["session_id"]
+    stdin_session_id = parsed["session_id"]
+    explicit = explicit_session_id.strip() if isinstance(explicit_session_id, str) else ""
+    stdin_id = stdin_session_id.strip() if isinstance(stdin_session_id, str) else ""
+    deregister_id = explicit or stdin_id or None
+    session_id = deregister_id
     transcript_path = parsed["transcript_path"]
     reason: str | None = None
+    # 身份只在入口捕获。marker 回落只给遥测，不能改这次要结束的实例。
+    ending = None
+    if hook_event != "Stop" and deregister_id:
+        ending = capture_session_end_identity(
+            SessionIndex(home=Path.home()),
+            runtime,
+            deregister_id,
+            datetime.now(timezone.utc),
+        )
     try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            candidate = data.get("reason")
-            if isinstance(candidate, str) and candidate.strip():
-                # 隐私不变式 D-22：session_ended.reason 与 gate_event.reason_excerpt 对齐，
-                # 均为受控自由文本，硬截断至 200 字（schema maxLength:200 对应）。
-                reason = candidate[:200]
-    except (TypeError, ValueError):
-        reason = None
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                candidate = data.get("reason")
+                if isinstance(candidate, str) and candidate.strip():
+                    # 隐私不变式 D-22：session_ended.reason 与 gate_event.reason_excerpt 对齐，
+                    # 均为受控自由文本，硬截断至 200 字（schema maxLength:200 对应）。
+                    reason = candidate[:200]
+        except (TypeError, ValueError):
+            reason = None
 
-    fallback = None
-    if not session_id:
-        # stdin 缺 session_id：按 runtime 过滤回落 registry，绝不跨 runtime 归因（§4.10）。
-        fallback = latest_marker(workspace, runtime=runtime)
-        if fallback is not None:
-            session_id = fallback.get("session_id")
-            if not transcript_path:
-                transcript_path = fallback.get("transcript_path")
+        fallback = None
+        if not session_id:
+            # stdin 缺 session_id：按 runtime 过滤回落 registry，绝不跨 runtime 归因（§4.10）。
+            fallback = latest_marker(workspace, runtime=runtime)
+            if fallback is not None:
+                session_id = fallback.get("session_id")
+                if not transcript_path:
+                    transcript_path = fallback.get("transcript_path")
 
-    duration_ms: int | None = None
-    if session_id:
-        matching = [
-            marker
-            for marker in iter_markers(workspace)
-            if marker.get("runtime") == runtime and marker.get("session_id") == session_id
-        ]
-        if matching:
-            first_ts = _parse_marker_ts(matching[0].get("ts"))
-            if first_ts is not None:
-                # duration = hook 时刻 − 首条 marker ts（不取末条 marker）。
-                duration_ms = int(
-                    (datetime.now(timezone.utc) - first_ts).total_seconds() * 1000
-                )
-            if not transcript_path:
-                transcript_path = matching[0].get("transcript_path")
+        duration_ms: int | None = None
+        if session_id:
+            matching = [
+                marker
+                for marker in iter_markers(workspace)
+                if marker.get("runtime") == runtime and marker.get("session_id") == session_id
+            ]
+            if matching:
+                first_ts = _parse_marker_ts(matching[0].get("ts"))
+                if first_ts is not None:
+                    # duration = hook 时刻 − 首条 marker ts（不取末条 marker）。
+                    duration_ms = int(
+                        (datetime.now(timezone.utc) - first_ts).total_seconds() * 1000
+                    )
+                if not transcript_path:
+                    transcript_path = matching[0].get("transcript_path")
 
-    cfg = TelemetryConfig.resolve(workspace)
-    if not cfg.detailed:
-        token_source = "none"
-        tokens = None
-    elif runtime == "claude-code":
-        tokens = SessionTokenSummarizer().summarize(transcript_path, budget=None)
-        token_source = "claude-transcript" if tokens is not None else "none"
-    elif runtime == "codex":
-        tokens = CodexRolloutReader().cumulative_tokens(transcript_path)
-        # D-26 ③：尾窗 miss 的 truncated 前缀旧值不得上报
-        if tokens is not None and getattr(tokens, "truncated", False):
+        cfg = TelemetryConfig.resolve(workspace)
+        if not cfg.detailed:
+            token_source = "none"
+            tokens = None
+        elif runtime == "claude-code":
+            tokens = SessionTokenSummarizer().summarize(transcript_path, budget=None)
+            token_source = "claude-transcript" if tokens is not None else "none"
+        elif runtime == "codex":
+            tokens = CodexRolloutReader().cumulative_tokens(transcript_path)
+            # D-26 ③：尾窗 miss 的 truncated 前缀旧值不得上报
+            if tokens is not None and getattr(tokens, "truncated", False):
+                try:
+                    sys.stderr.write("warning: codex rollout truncated\n")
+                except Exception:
+                    pass
+                tokens = None
+                token_source = "none"
+            else:
+                token_source = "codex-transcript" if tokens is not None else "none"
+        elif runtime == "grok-build":
+            grok_path = transcript_path or (fallback.get("session_file") if fallback else None)
+            tokens = GrokTokenSummarizer().summarize(grok_path, budget=None)
+            token_source = "grok-transcript" if tokens is not None else "none"
+        elif runtime == "kimi-code":
+            kimi_path = transcript_path or (fallback.get("session_file") if fallback else None)
+            tokens = KimiTokenSummarizer().summarize(
+                kimi_path, budget=None, workspace=str(workspace), marker=fallback
+            )
+            token_source = "kimi-transcript" if tokens is not None else "none"
+        elif runtime == "pi":
+            pi_path = transcript_path or (fallback.get("session_file") if fallback else None)
+            tokens = PiTokenSummarizer().summarize(pi_path, budget=None)
+            token_source = "pi-transcript" if tokens is not None else "none"
+        elif runtime == "antigravity":
+            token_source = "antigravity-transcript" if transcript_path else "none"
+            tokens = None
+        else:
+            token_source = "none"
+            tokens = None
+
+        if hook_event == "Stop":
+            # 旧 hook 仍每轮触发。只记遥测，调用方不得据此注销监听。
+            ended_trigger = "stop-hook"
+        else:
+            # DR-25：codex 改挂 SessionEnd 后与其它端同为每会话一条，沿用 schema 既有枚举。
+            ended_trigger = "session-end-hook"
+        payload: dict[str, Any] = {
+            "trigger": ended_trigger,
+            "reason": reason,
+            "duration_ms": duration_ms,
+            "token_source": token_source,
+            "tokens": tokens,
+        }
+        # 014 R22, 015 R3：session_ended 扩墙钟解释字段（tool_calls/subagent_spawns/
+        # context_pct_max/compactions/env_events/turns/cost_usd/api_duration_ms），
+        # 宿主会话文件 best-effort 计数、不可得为 null；fail-safe，解析异常不影响既有五键。
+        # 详细模式关闭时跳过大文件 IO（R9, D-1）。
+        if cfg.detailed:
             try:
-                sys.stderr.write("warning: codex rollout truncated\n")
+                extended = session_ended_extended_stats(
+                    runtime, session_id, transcript_path, workspace, marker=fallback
+                )
+                if isinstance(extended, dict):
+                    payload.update(extended)
             except Exception:
                 pass
-            tokens = None
-            token_source = "none"
-        else:
-            token_source = "codex-transcript" if tokens is not None else "none"
-    elif runtime == "grok-build":
-        grok_path = transcript_path or (fallback.get("session_file") if fallback else None)
-        tokens = GrokTokenSummarizer().summarize(grok_path, budget=None)
-        token_source = "grok-transcript" if tokens is not None else "none"
-    elif runtime == "kimi-code":
-        kimi_path = transcript_path or (fallback.get("session_file") if fallback else None)
-        tokens = KimiTokenSummarizer().summarize(
-            kimi_path, budget=None, workspace=str(workspace), marker=fallback
+        _emit_session_event(
+            runtime,
+            workspace,
+            "session_ended",
+            payload,
+            {
+                "name": runtime,
+                "session_id": session_id,
+                "attribution": "attributed" if session_id else "unattributed",
+            },
+            command="runtime session-end",
         )
-        token_source = "kimi-transcript" if tokens is not None else "none"
-    elif runtime == "pi":
-        pi_path = transcript_path or (fallback.get("session_file") if fallback else None)
-        tokens = PiTokenSummarizer().summarize(pi_path, budget=None)
-        token_source = "pi-transcript" if tokens is not None else "none"
-    elif runtime == "antigravity":
-        token_source = "antigravity-transcript" if transcript_path else "none"
-        tokens = None
-    else:
-        token_source = "none"
-        tokens = None
-
-    payload: dict[str, Any] = {
-        "trigger": "stop-hook" if hook_event == "Stop" else "session-end-hook",
-        "reason": reason,
-        "duration_ms": duration_ms,
-        "token_source": token_source,
-        "tokens": tokens,
-    }
-    # 014 R22, 015 R3：session_ended 扩墙钟解释字段（tool_calls/subagent_spawns/
-    # context_pct_max/compactions/env_events/turns/cost_usd/api_duration_ms），
-    # 宿主会话文件 best-effort 计数、不可得为 null；fail-safe，解析异常不影响既有五键。
-    # 详细模式关闭时跳过大文件 IO（R9, D-1）。
-    if cfg.detailed:
-        try:
-            extended = session_ended_extended_stats(
-                runtime, session_id, transcript_path, workspace, marker=fallback
-            )
-            if isinstance(extended, dict):
-                payload.update(extended)
-        except Exception:
-            pass
-    _emit_session_event(
-        runtime,
-        workspace,
-        "session_ended",
-        payload,
-        {
-            "name": runtime,
-            "session_id": session_id,
-            "attribution": "attributed" if session_id else "unattributed",
-        },
-        command="runtime session-end",
-    )
+    finally:
+        if ending is not None:
+            try:
+                _finalize_session_end(runtime, workspace, ending.session_id, reason, ending)
+            except Exception:
+                pass
 
 
 def command_session_mark(args: argparse.Namespace) -> int:
@@ -730,8 +1205,37 @@ def command_session_mark(args: argparse.Namespace) -> int:
     }
     if warning:
         data["warning"] = warning
+    _register_marked_session(args, workspace)
     emit(data, args.format)
     return 0
+
+
+def _register_marked_session(args: argparse.Namespace, workspace: Path) -> None:
+    """Pi 启动回调只走 session-mark。同步补会话索引，供后续身份解析使用。"""
+
+    session_id = getattr(args, "session_id", None)
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    runtime = getattr(args, "runtime", None)
+    if not isinstance(runtime, str) or not runtime.strip():
+        return
+    pid = getattr(args, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        pid = os.getppid()
+    try:
+        from datetime import datetime, timezone
+
+        written = SessionIndex(home=Path.home()).record_start(
+            SessionRef(runtime, session_id.strip(), pid, str(workspace)),
+            process_start_time(pid),
+            "session-mark",
+            datetime.now(timezone.utc),
+            lock_timeout=_HOOK_LOCK_SEC,
+        )
+        if written is not None:
+            resume_ended_watches(Path.home(), runtime, session_id.strip(), True)
+    except Exception:
+        return
 
 
 def command_runtime_session_end(args: argparse.Namespace) -> int:
@@ -743,14 +1247,55 @@ def command_runtime_session_end(args: argparse.Namespace) -> int:
     runtime = getattr(args, "runtime", None) or "unknown"
     workspace = Path(getattr(args, "target", ".") or ".")
     hook_event = getattr(args, "hook_event", None) or "SessionEnd"
+    explicit = getattr(args, "session_id", None)
     try:
-        _collect_session_ended(runtime, workspace, hook_event)
+        _collect_session_ended(runtime, workspace, hook_event, explicit)
     except Exception:
         pass  # 兜底防线：enqueue 失败绝不影响 hook 输出 / exit 0
+    envelope = _session_end_hook_envelope(hook_event, runtime)
+    # DR-25：空 stdout 只属于 ``--hook-json`` 且宿主不要 envelope 的路径（codex SessionEnd）。
+    # 兼容回放与非 hook 调用不带 ``--hook-json``，仍打印 ``{"status":"ok"}``。
     if getattr(args, "hook_json", False):
-        print(json.dumps(_session_end_hook_envelope(hook_event, runtime), ensure_ascii=False))
-    else:
-        print(json.dumps({"status": "ok"}, ensure_ascii=False))
+        if envelope is not None:
+            print(json.dumps(envelope, ensure_ascii=False))
+        return 0
+    print(json.dumps({"status": "ok"}, ensure_ascii=False))
+    return 0
+
+
+def command_runtime_turn_start(args: argparse.Namespace) -> int:
+    """UserPromptSubmit：注入队列摘录。任何异常退出码 0，按该端无事件形态输出。"""
+    runtime = str(getattr(args, "runtime", "") or "")
+    hook_json = bool(getattr(args, "hook_json", False))
+    if runtime == "grok-build" and getattr(args, "format", "text") != "text":
+        hook_json = True
+    text = ""
+    seq = 0
+    session_id = ""
+    queue_id = ""
+    reservation_id = ""
+    try:
+        text, seq, session_id, queue_id, reservation_id = _collect_turn_start_injection(runtime)
+    except Exception:
+        text, seq, session_id, queue_id, reservation_id = "", 0, "", "", ""
+    emitted = False
+    try:
+        _emit_turn_start(runtime, text, hook_json)
+        emitted = True
+    except Exception:
+        emitted = False
+    if seq > 0 and session_id:
+        try:
+            _hook_watch_service().confirm_turn_inject(
+                runtime,
+                session_id,
+                seq,
+                emitted and bool(text),
+                queue_id,
+                reservation_id,
+            )
+        except Exception:
+            pass
     return 0
 
 

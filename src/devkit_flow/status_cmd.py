@@ -720,6 +720,31 @@ def task_progress_summary(workspace: Path, feature: dict[str, Any]) -> dict[str,
     }
 
 
+def _format_pr_review_status_line(node: Any) -> str | None:
+    """接口 §2.14 / §11：``progress-bar:`` 之后恰一行。未启用时省略 tracking / pending 尾段。"""
+    if not isinstance(node, dict):
+        return None
+    config = node.get("config")
+    if not isinstance(config, dict):
+        return None
+    sources = config.get("sources") if isinstance(config.get("sources"), dict) else {}
+    source = str(sources.get("enabled") or "default")
+    if any(char in source for char in ")\r\n"):
+        source = "default"
+    line = f"pr-review: {'on' if config.get('enabled') else 'off'} (source={source})"
+    if not config.get("enabled"):
+        return line
+    tracking = node.get("tracking")
+    tracking_count = len(tracking) if isinstance(tracking, list) else 0
+    pending = node.get("pending") if isinstance(node.get("pending"), dict) else {}
+    pending_count = 0
+    for key in ("toReview", "cleanupPending", "ownersPending", "escalated", "staleLeases"):
+        value = pending.get(key, 0)
+        if type(value) is int:
+            pending_count += value
+    return f"{line} · tracking {tracking_count} · pending {pending_count}"
+
+
 def _append_flow_config_status_lines(lines: list[str], data: dict[str, Any]) -> None:
     specrules = data.get("specrules")
     if isinstance(specrules, dict) and "effective_state" in specrules:
@@ -736,6 +761,9 @@ def _append_flow_config_status_lines(lines: list[str], data: dict[str, Any]) -> 
     progress_bar = data.get("progress_bar")
     if isinstance(progress_bar, dict) and "enabled" in progress_bar:
         lines.append(format_progress_bar_status_text(progress_bar))
+        pr_review_line = _format_pr_review_status_line(data.get("pr_review"))
+        if pr_review_line is not None and lines[-1].startswith("progress-bar: "):
+            lines.append(pr_review_line)
     spec_artifacts = data.get("spec_artifacts")
     if isinstance(spec_artifacts, dict) and "enabled" in spec_artifacts:
         lines.append(format_spec_artifacts_status_text(spec_artifacts))

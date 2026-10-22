@@ -13,7 +13,7 @@ from devkit_flow.version import NPM_PACKAGE_NAME, NPM_REGISTRY
 
 
 def find_global_cli() -> Path | None:
-    """定位全局 CLI：PATH 上的 devkit-flow（npm i -g 的 npm 全局 bin）优先，~/.devkit/bin 兜底。
+    """定位全局 CLI：PATH 上的 devkit-flow（npm i -g 的 npm 全局 bin）优先，~/.config/devkit/bin 兜底。
 
     两处都没有时返回 None，由调用方决定报错还是回退到当前运行文件。
     """

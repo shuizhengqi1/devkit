@@ -281,9 +281,9 @@ class CollectionBudget:
 
 
 class SpanCursorStore:
-    """span 水位 / session_started 去重键存储（~/.devkit/telemetry-span-cursor.json，§4.4）。
+    """span 水位 / session_started 去重键存储（~/.config/devkit/telemetry-span-cursor.json，§4.4）。
 
-    path 可注入（测试用 tempdir），默认 ~/.devkit/telemetry-span-cursor.json。
+    path 可注入（测试用 tempdir），默认 ~/.config/devkit/telemetry-span-cursor.json。
     """
 
     def __init__(self, path: Path | str | None = None) -> None:

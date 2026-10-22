@@ -376,7 +376,7 @@ def _dispatch_self_update(args: Any) -> int:
 
 def _dispatch_runtime_family(args: Any) -> int | None:
     """runtime / migrate / plugin / upgrade：全部由 runtime 模块承载（白名单 lazy import）。"""
-    from devkit_flow.runtime import command_migrate_legacy_workspace, command_plugin_install, command_runtime_check, command_runtime_install, command_runtime_recover, command_runtime_rollback, command_runtime_session_end, command_runtime_uninstall, command_runtime_update, command_session_mark, command_upgrade
+    from devkit_flow.runtime import command_migrate_legacy_workspace, command_plugin_install, command_runtime_check, command_runtime_install, command_runtime_recover, command_runtime_rollback, command_runtime_session_end, command_runtime_turn_start, command_runtime_uninstall, command_runtime_update, command_session_mark, command_upgrade
 
     if args.command == "upgrade":
         return command_upgrade(args)
@@ -387,6 +387,8 @@ def _dispatch_runtime_family(args: Any) -> int | None:
             return command_runtime_update(args)
         if args.runtime_command == "check":
             return command_runtime_check(args)
+        if args.runtime_command == "turn-start":
+            return command_runtime_turn_start(args)
         if args.runtime_command == "session-end":
             return command_runtime_session_end(args)
         if args.runtime_command == "install":
@@ -543,6 +545,53 @@ def _dispatch_flow(args: Any) -> int | None:
     return None
 
 
+def _dispatch_pr_review(args: Any) -> int | None:
+    """pr-review 命令族：白名单 lazy import（仿 _dispatch_bridge）。"""
+    from devkit_flow.bridge_watch_deliver import build_channel_probes, build_notify_deliverer
+    from devkit_flow.pr_review_cmd import PrReviewCommand, install_channel_probe_factory
+
+    install_channel_probe_factory(build_channel_probes)
+    command = args.pr_review_command
+    if command == "status":
+        return PrReviewCommand.command_pr_review_status(args)
+    if command == "configure":
+        return PrReviewCommand.command_pr_review_configure(args)
+    if command == "poll":
+        return PrReviewCommand.command_pr_review_poll(args)
+    if command == "run":
+        return PrReviewCommand.command_pr_review_run(args)
+    if command == "merge":
+        return PrReviewCommand.command_pr_review_merge(args)
+    if command == "owners":
+        return PrReviewCommand.command_pr_review_owners(args)
+    if command == "repos":
+        return PrReviewCommand.command_pr_review_repos(args)
+    if command == "ledger":
+        return PrReviewCommand.command_pr_review_ledger(args)
+    if command == "worktree":
+        return PrReviewCommand.command_pr_review_worktree(args)
+    if command == "track":
+        return PrReviewCommand.command_pr_review_track(args)
+    if command == "report":
+        return PrReviewCommand.command_pr_review_report(args)
+    if command == "act":
+        return PrReviewCommand.command_pr_review_act(args)
+    if command == "show":
+        return PrReviewCommand.command_pr_review_show(args)
+    if command == "prepare-review":
+        return PrReviewCommand.command_pr_review_prepare_review(args)
+    if command == "reply":
+        return PrReviewCommand.command_pr_review_reply(args)
+    if command == "watch":
+        deliverer = NullDeliverer()
+        if getattr(args, "watch_command", None) in {"tick", "converge"}:
+            raw_target = getattr(args, "target", None)
+            workspace = Path(str(raw_target)).expanduser() if raw_target else Path.cwd()
+            deliverer = build_notify_deliverer(workspace)
+        return PrReviewCommand.command_pr_review_watch(args, deliverer)
+    return None
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -672,6 +721,8 @@ def main() -> int:
             result = _dispatch_ones(args)
         if args.command == "flow":
             result = _dispatch_flow(args)
+        if args.command == "pr-review":
+            result = _dispatch_pr_review(args)
         if result is not None:
             return result
         raise AssertionError(f"unhandled command: {args.command}")

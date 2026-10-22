@@ -421,7 +421,7 @@ ONES_OUTBOX_SCHEMA_VERSION = 1
 STATE_OUTBOX_PREFLIGHT_SCOPE = "feature"
 
 
-# PATH 之外的全局兜底安装位置 ~/.devkit/bin/。项目内同路径仅用于识别和迁移旧副本。
+# PATH 之外的全局兜底安装位置 ~/.config/devkit/bin/。项目内同路径仅用于识别和迁移旧副本。
 DEVKIT_CLI_RELATIVE_PATH = Path(".devkit") / "bin" / "devkit-flow"
 
 
@@ -469,7 +469,7 @@ SPECRULES_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "devkit-specrules"
 SPECRULES_CUSTOM_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "specrules-cache"
 
 
-# 项目画像缓存目录（feature 016 设计 §4.7.1.2 / 接口 §8.2）：~/.devkit/cache/project-profiles/<sha256(realpath)[:16]>.json
+# 项目画像缓存目录（feature 016 设计 §4.7.1.2 / 接口 §8.2）：~/.config/devkit/cache/project-profiles/<sha256(realpath)[:16]>.json
 PROJECT_PROFILE_CACHE_RELATIVE_PATH = Path(".config") / "devkit" / "cache" / "project-profiles"
 
 
@@ -1071,3 +1071,627 @@ TELEMETRY_SSO_INSTALL_COMMAND: list[str] = []
 
 
 TELEMETRY_SSO_TOKEN_HEADER = ""
+
+
+# --- pr-review（017 T-02）：帮助文案、目录、默认值、标记正则、动作全集、PRV 错误码 ---
+# 目录与默认值以设计 §4.3.1 / §4.3.2 与接口 §5 / §8 为准。标记正则逐字来自接口 §5，
+# 尾部 `(?P<rest>(?: \S+)*)$` 为 DR-58；#303 别名同样收尾，使未知词可忽略。
+
+PR_REVIEW_HELP = "Review pull requests, track feature PRs, and run review jobs. Default off."
+
+
+PR_REVIEW_INVALID_LAYER = "Invalid prReview"
+
+
+PR_REVIEW_PROJECT_DIR = ".devkit/review"
+
+
+PR_REVIEW_HOME_DIR = "~/.config/devkit/review"
+
+
+PR_REVIEW_REPOS_FILENAME = "repos.json"
+
+
+PR_REVIEW_DEVICES_FILENAME = "devices.json"
+
+
+PR_REVIEW_AUTOMATION_FILENAME = "automation.json"
+
+
+PR_REVIEW_OWNERS_FILENAME = "owners.yaml"
+
+
+PR_REVIEW_REQUIREMENTS_FILENAME = "requirements.md"
+
+
+PR_REVIEW_SUBDIRS = (
+    "ledger",
+    "worktrees",
+    "cache",
+    "reports",
+    "track",
+    "runs",
+    "state",
+    "playbooks",
+    "logs",
+)
+
+
+PR_REVIEW_DEFAULT_ENABLED = False
+
+
+PR_REVIEW_DEFAULT_AUTO_RUN = False
+
+
+PR_REVIEW_DEFAULT_INTERVAL = 120
+
+
+PR_REVIEW_INTERVAL_MIN = 60
+
+
+PR_REVIEW_INTERVAL_MAX = 3600
+
+
+PR_REVIEW_DEFAULT_HEADLESS_REVIEW = False
+
+
+PR_REVIEW_DEFAULT_MAX_PROBE_PER_ROUND = 50
+
+
+PR_REVIEW_MAX_PROBE_PER_ROUND_MIN = 1
+
+
+PR_REVIEW_MAX_PROBE_PER_ROUND_MAX = 200
+
+
+PR_REVIEW_DEFAULT_LEASE_TTL_HOURS = 12
+
+
+# D-29：live / push 档未确认送达超过该分钟数则降级并换通道重推一次。
+PR_REVIEW_DEFAULT_DELIVERY_ALERT_MINUTES = 5
+
+
+PR_REVIEW_DELIVERY_ALERT_MINUTES_MIN = 1
+
+
+PR_REVIEW_DELIVERY_ALERT_MINUTES_MAX = 120
+
+
+PR_REVIEW_LEASE_TTL_HOURS_MIN = 1
+
+
+PR_REVIEW_LEASE_TTL_HOURS_MAX = 168
+
+
+PR_REVIEW_DEFAULT_MAX_PARALLEL = 2
+
+
+PR_REVIEW_MAX_PARALLEL_MIN = 1
+
+
+PR_REVIEW_MAX_PARALLEL_MAX = 8
+
+
+PR_REVIEW_DEFAULT_LIST_LIMIT = 200
+
+
+PR_REVIEW_LIST_LIMIT_MIN = 30
+
+
+PR_REVIEW_LIST_LIMIT_MAX = 500
+
+
+PR_REVIEW_DEFAULT_ROLES = ("author", "reviewer")
+
+
+PR_REVIEW_DEFAULT_REQUIREMENTS_FILE = ".devkit/review/requirements.md"
+
+
+PR_REVIEW_DEFAULT_MERGE_METHOD = "merge"
+
+
+PR_REVIEW_MERGE_METHODS = ("merge", "squash", "rebase")
+
+
+PR_REVIEW_DEFAULT_NOTIFY_ENABLED = True
+
+
+PR_REVIEW_DEFAULT_NOTIFY_EVENTS = (
+    "fail",
+    "merged",
+    "hold",
+    "job_result",
+    "escalated",
+    "cleanup_pending",
+    "auth_expired",
+)
+
+
+PR_REVIEW_DEFAULT_REPLY_MODE = "top-level"
+
+
+PR_REVIEW_REPLY_MODES = ("top-level", "rest")
+
+
+PR_REVIEW_DEFAULT_PLATFORM_HOST = ""
+
+
+PR_REVIEW_RUNTIMES = ("claude", "codex", "kimi", "grok", "pi")
+
+
+PR_REVIEW_DEFAULT_TRACK_ENABLED = True
+
+
+PR_REVIEW_DEFAULT_TRACK_AUTO_CLAIM = True
+
+
+PR_REVIEW_DEFAULT_TRACK_AUTO_FIX = False
+
+
+PR_REVIEW_DEFAULT_TRACK_REMIND_DAYS = 7
+
+
+# 与 specArchive.inactiveDays 数值对齐、常量不共用（DR-17）。
+PR_REVIEW_STALE_DAYS = 30
+
+
+PR_REVIEW_DEFAULT_TRACK_STALE_DAYS = PR_REVIEW_STALE_DAYS
+
+
+PR_REVIEW_DEFAULT_MAX_FIX_PER_FINDING = 1
+
+
+PR_REVIEW_DEFAULT_AUTOMATION_PROVIDER = "auto"
+
+
+PR_REVIEW_AUTOMATION_PROVIDERS = ("auto", "orca", "launchd", "schtasks", "manual")
+
+
+PR_REVIEW_ACTION_KEYS = ("comment", "approve", "selfReview", "runTests", "createPr")
+
+
+# selfReview 是候选过滤，不进入动作全集（DR-10 / DR-37）。
+ACTION_UNIVERSE = frozenset({"comment", "approve", "run_tests", "create_pr"})
+
+
+PR_REVIEW_ACTION_IDS = ("comment", "approve", "run_tests", "create_pr")
+
+
+PR_REVIEW_LEASE_TTL_SEC = 3600
+
+
+# 证据保留期与 launchd 日志截断（DR-92 / DR-94）。日志阈值不是配置键。
+PR_REVIEW_EVIDENCE_DAYS_DEFAULT = 14
+
+
+PR_REVIEW_EVIDENCE_DAYS_MAX = 365
+
+
+PR_REVIEW_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+PR_REVIEW_LOG_KEEP_BYTES = 1 * 1024 * 1024
+
+
+PR_REVIEW_LOG_ALIGN_BYTES = 64 * 1024
+
+
+PR_REVIEW_DEVICE_GLOBAL_ONLY = "prReview.device is global-only and was ignored"
+
+
+PR_REVIEW_AUTOMATION_GLOBAL_ONLY = "prReview.automation is global-only and was ignored"
+
+
+PR_REVIEW_PLATFORM_HOST_GLOBAL_ONLY = "prReview.platform.host is global-only and was ignored"
+
+
+PR_REVIEW_RETENTION_GLOBAL_ONLY = "prReview.retention is global-only and was ignored"
+
+
+PR_REVIEW_INTERVAL_GLOBAL_ONLY = "prReview.interval is global-only"
+
+
+PR_REVIEW_WATCH_GLOBAL_ONLY = "prReview.watch is global-only and was ignored"
+
+
+PR_REVIEW_DOCTOR_WINDOWS_PRIMARY = "Windows 设备为 primary，请确认 macmini 已设 primary=false"
+
+
+PR_REVIEW_DOCTOR_HTTP_INFO = "REST 走 http（内网）"
+
+
+PR_REVIEW_REPO_SOURCES = ("setup", "manual")
+
+
+# (code, meaning, typical exit). PRV-007 拒绝路径为 2，仅记录路径为 0（接口 §3）。
+# PRV-032 只记录、退出码 0。PRV-034 单目标命令为 1；tick 只记 errors[]、进程退出码 0。
+PR_REVIEW_ERROR_CODES: tuple[tuple[str, str, int], ...] = (
+    ("PRV-001", "prReview 配置无效 / scope 不允许 / 凭证键", 1),
+    ("PRV-002", "code-cli 不可用或未登录", 1),
+    ("PRV-003", "无法解析 project/repo", 2),
+    ("PRV-004", "repos.json / 台账 / 跟踪记录损坏", 1),
+    ("PRV-005", "运行锁被持有 / 台账 BUSY", 4),
+    ("PRV-006", "worktree 创建失败", 1),
+    ("PRV-007", "worktree 清理失败或 cleanup 拒绝", 2),
+    ("PRV-008", "headless runtime 不可用", 1),
+    ("PRV-009", "合并执行失败", 1),
+    ("PRV-010", "act 越权", 2),
+    ("PRV-011", "push 硬闸拒绝", 2),
+    ("PRV-012", "feature 未完成 / 分支不匹配 / PR 非 open", 2),
+    ("PRV-013", "owners.yaml 校验失败", 1),
+    ("PRV-014", "playbook frontmatter 校验失败", 1),
+    ("PRV-015", "[devkit-job] 发送者不可信（记录并忽略）", 0),
+    ("PRV-016", "requireIssueAssociated 且分支无关联 issue", 2),
+    ("PRV-017", "平台限流 / 连续失败本轮终止", 1),
+    ("PRV-018", "review.json / fix-result.json schema 校验失败", 2),
+    ("PRV-019", "自动化前置条件不满足", 2),
+    ("PRV-020", "台账 finish / checkpoint 条件不满足", 2),
+    ("PRV-021", "台账 owner 不匹配或记录已 release", 2),
+    ("PRV-022", "外部命令超时", 124),
+    ("PRV-023", "外部命令非零退出且未被模块映射", 1),
+    ("PRV-024", "device-mention 作业 source 与 PR sourceSha 不一致", 0),
+    ("PRV-025", "运维自清理 I/O 失败（证据目录删除 / 日志截断）", 0),
+    ("PRV-026", "无法识别当前会话（非六端、拿不到 sessionId、显式身份不在会话索引或已结束）", 2),
+    ("PRV-027", "监听目标被其他会话持有（未 --takeover）", 2),
+    ("PRV-028", "要注销的监听不存在", 2),
+    ("PRV-029", "监听参数非法（车道与范围不匹配、仓库不在 repos.json、stop 选择器个数不为 1、--all 缺 --yes）", 2),
+    ("PRV-030", "系统定时器安装 / 卸载失败（CLI 内联收敛时安装失败则登记回滚；watch converge 失败则标志保留；tick 只记录派生失败到 errors[]）", 1),
+    ("PRV-031", "MCode 登录失效（pat get 失败、REST 401、auth status 未登录）", 1),
+    ("PRV-032", "原生通道送达失败（只记录，事件留队列转下一轮注入）", 0),
+    ("PRV-033", "当前平台无可用系统定时器（非 darwin / nt）", 2),
+    ("PRV-034", "平台权限不足（REST 403）：只影响该仓 / 该 PR，唤醒持有该目标的会话（access_denied），不暂停其他监听、不尝试重新登录", 1),
+)
+
+
+PR_REVIEW_ERROR_EXIT = {code: exit_code for code, _meaning, exit_code in PR_REVIEW_ERROR_CODES}
+
+
+_PR_REVIEW_REST = r"(?P<rest>(?: \S+)*)$"
+
+
+PR_REVIEW_MARKER_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        "review",
+        r"^\[devkit-review\] #(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40}) "
+        r"verdict=(?P<verdict>PASS|FAIL|INCOMPLETE) round=(?P<round>\d+)"
+        r"(?: prev=(?P<prev>[0-9a-f]{40}))?(?P<self> self-reviewed)?" + _PR_REVIEW_REST,
+    ),
+    (
+        "fixed-pushed",
+        r"^\[devkit-review\] fixed=(?P<ids>[BS]\d+(?:,[BS]\d+)*) "
+        r"sha=(?P<sha>[0-9a-f]{40}) status=pushed" + _PR_REVIEW_REST,
+    ),
+    (
+        "fixed-verified",
+        r"^\[devkit-review\] fixed=(?P<id>[BS]\d+) sha=(?P<sha>[0-9a-f]{40}) ✅ 已验证"
+        + _PR_REVIEW_REST,
+    ),
+    (
+        "merged",
+        r"^\[devkit-review\] merged #(?P<pr>\d+) → (?P<target>\S+) "
+        r"merge=(?P<hash>[0-9a-f]{7,40})" + _PR_REVIEW_REST,
+    ),
+    (
+        "hold",
+        r"^\[devkit-review\] hold #(?P<pr>\d+)：(?P<reasons>.+)$",
+    ),
+    (
+        "job-verified",
+        r"^\[devkit-review\] job-verified playbook=(?P<playbook>[a-z0-9-]+) "
+        r"kind=(?P<kind>[a-z0-9-]+) qa=#(?P<qa>\d+) source=(?P<source>[0-9a-f]{40}) "
+        r"verdict=(?P<verdict>PASS|FAIL|BLOCKED)" + _PR_REVIEW_REST,
+    ),
+    (
+        "job-artifact",
+        r"^\[devkit-job\] artifact origin=#(?P<origin>\d+) "
+        r"playbook=(?P<playbook>[a-z0-9-]+) source=(?P<source>[0-9a-f]{40})"
+        + _PR_REVIEW_REST,
+    ),
+    (
+        "job-superseded",
+        r"^\[devkit-job\] superseded by=#(?P<by>\d+) source=(?P<source>[0-9a-f]{40})"
+        + _PR_REVIEW_REST,
+    ),
+    (
+        "job-post",
+        r"^\[devkit-job\] kind=(?P<kind>[a-z0-9-]+) to=@(?P<to>[a-z0-9-]+) "
+        r"id=(?P<id>[A-Za-z0-9-]+) source=(?P<sha>[0-9a-f]{40})" + _PR_REVIEW_REST,
+    ),
+    (
+        "job-ack",
+        r"^\[devkit-job\] ack id=(?P<id>\S+) device=(?P<device>\S+) "
+        r"machine=(?P<machine>\S+) status=(?P<status>QUEUED|RUNNING)" + _PR_REVIEW_REST,
+    ),
+    (
+        "job-log",
+        r"^\[devkit-job\] log id=(?P<id>\S+) n=(?P<n>\d+)/(?P<total>\d+)" + _PR_REVIEW_REST,
+    ),
+    (
+        "job-result",
+        r"^\[devkit-job\] result id=(?P<id>\S+) verdict=(?P<verdict>PASS|FAIL|BLOCKED)"
+        + _PR_REVIEW_REST,
+    ),
+    (
+        "job-ack-alias",
+        r"^(?P<alias>QA_ACK) jobId=(?P<id>\S+) machine=(?P<machine>\S+) "
+        r"reporterMis=(?P<mis>\S+) status=(?P<status>\S+)" + _PR_REVIEW_REST,
+    ),
+    (
+        "job-result-alias",
+        r"^(?P<alias>ORDERKIT_WINDOWS_QA_RESULT)\b" + _PR_REVIEW_REST,
+    ),
+)
+
+
+PR_REVIEW_MARKER_REGEX = tuple(
+    (name, re.compile(pattern, re.ASCII | re.MULTILINE))
+    for name, pattern in PR_REVIEW_MARKER_PATTERNS
+)
+
+
+# --- pr-review watch（018 T-02）：加性常量。不改既有默认值，不改既有首行正则。 ---
+# 路径分两类锚点：
+# - PR_REVIEW_WATCH_*_REL、日志、legacy 相对 ~/.config/devkit/review（PR_REVIEW_HOME_DIR）
+# - DEVKIT_SESSION_* / DEVKIT_CLAUDE_INBOX_* 相对 ~/.config/devkit
+# 本模块没有平台分支；darwin / nt 只作为字典键。
+
+PR_REVIEW_WATCH_REGISTRY_REL = "watch/registry.json"
+
+
+PR_REVIEW_WATCH_QUEUES_REL = "watch/queues"
+
+
+PR_REVIEW_WATCH_AUTH_REL = "watch/auth.json"
+
+
+PR_REVIEW_WATCH_LAST_TICK_REL = "watch/last-tick.json"
+
+
+PR_REVIEW_WATCH_TICK_LOCK_REL = "watch/tick.lock"
+
+
+PR_REVIEW_WATCH_CONVERGE_LOCK_REL = "watch/converge.lock"
+
+
+PR_REVIEW_WATCH_REGISTRY_LOCK_REL = "watch/registry.lock"
+
+
+PR_REVIEW_WATCH_TICK_HIDDEN_VBS_REL = "watch/tick-hidden.vbs"
+
+
+PR_REVIEW_WATCH_TICK_LOG_REL = "logs/watch-tick.log"
+
+
+PR_REVIEW_WATCH_CONVERGE_LOG_REL = "logs/watch-converge.log"
+
+
+PR_REVIEW_WATCH_LEGACY_CLEANUP_REL = "state/legacy-scheduler-cleanup.json"
+
+
+DEVKIT_SESSION_INDEX_REL = "session-index.json"
+
+
+DEVKIT_SESSION_INDEX_LOCK_REL = "session-index.lock"
+
+
+DEVKIT_CLAUDE_INBOX_TEMPLATE = "sessions/claude-code/<sidKey>.inbox.json"
+
+
+# DR-46 全局锁序 0→4。队列锁的文件名是 <sidKey>.lock，不是固定文件名。
+PR_REVIEW_WATCH_LOCK_NAMES = (
+    "converge.lock",
+    "tick.lock",
+    "registry.lock",
+    "<sidKey>.lock",
+    "session-index.lock",
+)
+
+
+# sidKey：sessionId 中 [A-Za-z0-9._-] 以外替换为 _，超长截断后加 sha1 前 8 位（DR-10）。
+PR_REVIEW_WATCH_SID_KEY_MAX_LEN = 80
+
+
+PR_REVIEW_WATCH_SID_KEY_SHA1_LEN = 8
+
+
+PR_REVIEW_WATCH_LAUNCHD_LABEL = "com.devkit.pr-review-watch"
+
+
+PR_REVIEW_WATCH_TASK_NAME = "DevkitDevkitPrReviewWatch"
+
+
+PR_REVIEW_WATCH_TIMER_PERIOD_SEC = 60
+
+
+# E8 未通过的平台由 T-37 把对应值改为 False（D-20 ⑥）。键是数据，不是分支。
+PR_REVIEW_WATCH_DETACHED_CONVERGE = {"darwin": True, "nt": True}
+
+
+PR_REVIEW_WATCH_MAX_PAGES = 20
+
+
+PR_REVIEW_WATCH_SEEN_IDS_MAX = 5000
+
+
+PR_REVIEW_WATCH_QUEUE_PENDING_MAX = 1000
+
+
+PR_REVIEW_WATCH_QUEUE_DELIVERED_KEEP = 200
+
+
+PR_REVIEW_WATCH_SEEN_EVENT_KEYS_MAX = 2000
+
+
+PR_REVIEW_WATCH_IN_FLIGHT_SEC = 15
+
+
+PR_REVIEW_WATCH_PUSH_FAILURE_THRESHOLD = 3
+
+
+PR_REVIEW_WATCH_TAIL_POLL_SEC = 3
+
+
+PR_REVIEW_WATCH_HEARTBEAT_SEC = 60
+
+
+# D-29：心跳文件超过 3 个间隔视为实时通道断开。
+PR_REVIEW_WATCH_HEARTBEAT_MISS_FACTOR = 3
+
+
+PR_REVIEW_WATCH_HEARTBEATS_REL = "watch/heartbeats"
+
+
+# D-28：结束快照与未完成的 session-end 保留期 = leaseTtl × 本倍数。
+# 默认 12 小时 × 14 = 7 天，与会话索引里结束标记的清理窗口同量级。
+PR_REVIEW_WATCH_END_RETENTION_MULTIPLIER = 14
+
+
+PR_REVIEW_WATCH_ENDED_SNAPSHOTS_REL = "watch/ended-snapshots.json"
+
+
+PR_REVIEW_WATCH_PENDING_RESTORES_REL = "watch/pending-restores.json"
+
+
+PR_REVIEW_WATCH_TAIL_FRESHNESS_SEC = 150
+
+
+PR_REVIEW_WATCH_CLI_TICK_LOCK_WAIT_SEC = 30
+
+
+PR_REVIEW_WATCH_HOOK_LOCK_TIMEOUT_MS = 200
+
+
+PR_REVIEW_WATCH_REMIND_SEC = 4 * 60 * 60
+
+
+PR_REVIEW_WATCH_MOA_TIMEOUT_SEC = 45
+
+
+PR_REVIEW_WATCH_MIS_CACHE_SEC = 3600
+
+
+SESSION_LEASE_DEFAULT_SEC = 12 * 60 * 60
+
+
+PR_REVIEW_WATCH_INJECT_MAX_CHARS = 2000
+
+
+# 推送通道完整形态上限（接口 §4.3）；下一轮注入用 INJECT_MAX_CHARS。
+PR_REVIEW_WATCH_PUSH_MAX_CHARS = 4000
+
+
+PR_REVIEW_WATCH_EXCERPT_MAX_CHARS = 280
+
+
+PR_REVIEW_WATCH_TITLE_MAX_CHARS = 120
+
+
+PR_REVIEW_WATCH_BRANCH_MAX_CHARS = 120
+
+
+PR_REVIEW_WATCH_DISPLAY_NAME_MAX_CHARS = 120
+
+
+PR_REVIEW_WATCH_PATH_MAX_CHARS = 240
+
+
+PR_REVIEW_WATCH_GAP_PREVIEW_MAX = 5
+
+
+PR_REVIEW_WATCH_GAP_PR_MAX = 10
+
+
+PR_REVIEW_WATCH_BACKLOG_MAX = 20
+
+
+PR_REVIEW_WATCH_OUTBOX_MAX = 500
+
+
+PR_REVIEW_WATCH_LOG_MAX_BYTES = PR_REVIEW_LOG_MAX_BYTES
+
+
+PR_REVIEW_WATCH_LOG_KEEP_BYTES = PR_REVIEW_LOG_KEEP_BYTES
+
+
+PR_REVIEW_WATCH_PARENT_CHAIN_DEPTH = 8
+
+
+PR_REVIEW_WATCH_EVENT_KINDS = (
+    "approval",
+    "review_comment",
+    "job_result",
+    "review_requested",
+    "mentioned",
+    "new_commit",
+    "rereview_requested",
+    "author_reply",
+    "pr_closed",
+    "watch_taken_over",
+    "watch_restored",
+    "gap_summary",
+    "review_backlog",
+    "auth_expired",
+    "auth_recovered",
+    "access_denied",
+    "timer_failed",
+)
+
+
+# 系统通知留在登记时的会话实例；其余 kind 按当前归属改投（DR-53）。
+PR_REVIEW_WATCH_SYSTEM_KINDS = (
+    "auth_expired",
+    "auth_recovered",
+    "access_denied",
+    "timer_failed",
+    "watch_taken_over",
+    "watch_restored",
+)
+
+
+PR_REVIEW_WATCH_LANES = ("author", "review", "both")
+
+
+PR_REVIEW_WATCH_WAKE_LEVELS = ("live-pull", "push", "next-turn")
+
+
+# DR-6：环境变量 → runtime。同时存在多个时由调用方按父进程链取最近祖先。
+PR_REVIEW_WATCH_SESSION_ENV_VARS = (
+    ("claude-code", "CLAUDE_CODE_SESSION_ID"),
+    ("codex", "CODEX_THREAD_ID"),
+    ("kimi-code", "KIMI_SESSION_ID"),
+    ("pi", "PI_SESSION_ID"),
+    ("grok-build", "GROK_SESSION_ID"),
+    ("antigravity", "ANTIGRAVITY_CONVERSATION_ID"),
+)
+
+
+PR_REVIEW_WATCH_RUNTIME_EXECUTABLES = (
+    ("claude-code", ("claude",)),
+    ("codex", ("codex",)),
+    ("kimi-code", ("kimi",)),
+    ("grok-build", ("grok",)),
+    ("pi", ("pi", "node")),
+    ("antigravity", ("agy", "antigravity")),
+)
+
+
+PR_REVIEW_WATCH_CLAUDE_PID_ENV = "CLAUDE_PID"
+
+
+PR_REVIEW_WATCH_CLAUDE_CHILD_SESSION_ENV = "CLAUDE_CODE_CHILD_SESSION"
+
+
+# 接口 §5.1。只认最后一个命中行；不进入 PR_REVIEW_MARKER_PATTERNS。
+PR_REVIEW_META_LINE_PATTERN = r"^\[devkit-meta\](?P<fields>(?: [A-Za-z]+=\S+)+)\s*$"
+
+
+PR_REVIEW_META_LINE_REGEX = re.compile(PR_REVIEW_META_LINE_PATTERN, re.ASCII | re.MULTILINE)
+
+
+# 接口 §5.2。既有首行正则保持原样，reply 单独编译。
+PR_REVIEW_REPLY_MARKER_PATTERN = (
+    r"^\[devkit-review\] reply #(?P<pr>\d+) to=(?P<to>\d+|-)" + _PR_REVIEW_REST
+)
+
+
+PR_REVIEW_REPLY_MARKER_REGEX = re.compile(PR_REVIEW_REPLY_MARKER_PATTERN, re.ASCII | re.MULTILINE)

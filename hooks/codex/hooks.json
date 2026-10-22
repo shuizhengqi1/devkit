@@ -12,12 +12,23 @@
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "devkit-flow runtime session-end --runtime codex --target \"${PWD}\" --hook-json --hook-event Stop",
+            "command": "devkit-flow runtime session-end --runtime codex --target \"${PWD}\" --hook-json --hook-event SessionEnd",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "devkit-flow runtime turn-start --runtime codex --target \"${PWD}\" --hook-json",
             "timeout": 30
           }
         ]

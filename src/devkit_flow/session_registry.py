@@ -1,18 +1,41 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import select
 import sys
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
-from devkit_flow.constants import DASHBOARD_STEP_TIMINGS_FILE, STEP_TIMINGS_SCHEMA_VERSION
+from typing import Any, Callable, Mapping, Sequence
+from devkit_flow.constants import (
+    DASHBOARD_STEP_TIMINGS_FILE,
+    DEVKIT_SESSION_INDEX_LOCK_REL,
+    DEVKIT_SESSION_INDEX_REL,
+    PR_REVIEW_WATCH_CLAUDE_PID_ENV,
+    PR_REVIEW_WATCH_PARENT_CHAIN_DEPTH,
+    PR_REVIEW_WATCH_RUNTIME_EXECUTABLES,
+    PR_REVIEW_WATCH_SESSION_ENV_VARS,
+    PR_REVIEW_WATCH_SID_KEY_MAX_LEN,
+    PR_REVIEW_WATCH_SID_KEY_SHA1_LEN,
+    STEP_TIMINGS_SCHEMA_VERSION,
+)
 from devkit_flow.errors import DevkitFlowError
 from devkit_flow.parse_util import find_features, select_feature_for_ones
-from devkit_flow.textio import compact_error, emit
+from devkit_flow.textio import (
+    LockBusy,
+    atomic_write_text,
+    compact_error,
+    emit,
+    locked_path,
+    parent_pid_chain,
+    process_alive,
+    process_start_time,
+)
 
 # 中央 session registry（append-only JSONL）：回答「某 workspace 的哪些 runtime 会话
 # 加载过 devkit 插件」，供 flow 打标（归属）与 sessions list（反查）消费。
@@ -46,15 +69,21 @@ def append_session_marker(
     session_file: str | None = None,
     source: str,
     home: Path | None = None,
+    pid: int | None = None,
+    proc_started_at: str | None = None,
+    event: str | None = None,
+    reason: str | None = None,
 ) -> str | None:
     """追加一条 session marker；行小，open append 原子性足够。
 
+    ``pid`` / ``procStartedAt`` / ``event`` / ``reason`` 只在调用方给出时写入（加性，旧行不补键）。
     fail-safe：任何异常静默返回 warning 字符串（正常返回 None），绝不抛出。
+    不接受凭据字段。
     """
     try:
         path = registry_path(home)
         path.parent.mkdir(parents=True, exist_ok=True)
-        marker = {
+        marker: dict[str, Any] = {
             "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
             "runtime": str(runtime),
             "session_id": session_id or None,
@@ -63,11 +92,43 @@ def append_session_marker(
             "workspace": normalize_workspace(workspace),
             "source": source,
         }
+        parsed_pid = _parse_pid(pid)
+        if parsed_pid is not None:
+            marker["pid"] = parsed_pid
+        started = _session_optional_text(proc_started_at)
+        if started is not None:
+            marker["procStartedAt"] = started
+        event_text = _session_optional_text(event)
+        if event_text is not None:
+            marker["event"] = event_text
+        if reason is not None:
+            marker["reason"] = str(reason)
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(marker, ensure_ascii=False) + "\n")
         return None
     except Exception as error:  # fail-safe 兜底：marker 写入失败不得影响主流程
         return f"session marker 写入失败（不影响主流程）: {compact_error(error)}"
+
+
+def append_session_end(
+    *,
+    runtime: str,
+    workspace: Path | str,
+    session_id: str | None = None,
+    reason: str,
+    home: Path | None = None,
+    source: str = "session-end",
+) -> str | None:
+    """SessionEnd 审计行。hook 接线在 T-28；这里只追加 ``event:"end"``。"""
+    return append_session_marker(
+        runtime=runtime,
+        workspace=workspace,
+        session_id=session_id,
+        source=source,
+        home=home,
+        event="end",
+        reason=reason,
+    )
 
 
 def iter_markers(workspace: Path | str | None = None, home: Path | None = None) -> list[dict[str, Any]]:
@@ -555,3 +616,967 @@ def discover_workspace_sessions(
 
     discovered.sort(key=_sort_key, reverse=True)
     return discovered
+
+
+# ---------------------------------------------------------------------------
+# 会话索引、存活判定、当前会话解析（DR-6 / DR-7 / DR-9）
+# 只持 session-index.lock（锁序 4），持锁期间只做文件读写。
+# ---------------------------------------------------------------------------
+
+INDEX_SCHEMA_VERSION = 1
+_ENDED_PRUNE_AFTER = timedelta(days=7)
+_SEEN_PRUNE_AFTER = timedelta(days=30)
+_DEFAULT_INDEX_LOCK_TIMEOUT = 2.0
+_SID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+_KNOWN_RUNTIMES = frozenset(runtime for runtime, _variable in PR_REVIEW_WATCH_SESSION_ENV_VARS)
+
+
+def _process_basename(name: object) -> str:
+    text = str(name).strip().replace("\\", "/")
+    base = text.rsplit("/", 1)[-1]
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return base.casefold()
+
+
+_EXECUTABLES = {
+    runtime: frozenset(_process_basename(name) for name in names)
+    for runtime, names in PR_REVIEW_WATCH_RUNTIME_EXECUTABLES
+}
+
+
+class SessionIndexReadError(Exception):
+    """会话索引存在但读不出来。判定方把它当成 unknown，不覆盖原文件。"""
+
+
+def session_key(runtime: str, session_id: str) -> str:
+    return f"{runtime}:{session_id}"
+
+
+def sid_key(session_id: str) -> str:
+    """sessionId 里非 [A-Za-z0-9._-] 换成 _；超过 80 字符截断后再加 sha1 前 8 位。"""
+    cleaned = _SID_UNSAFE.sub("_", str(session_id))
+    if len(cleaned) <= PR_REVIEW_WATCH_SID_KEY_MAX_LEN:
+        return cleaned
+    digest = hashlib.sha1(str(session_id).encode("utf-8")).hexdigest()
+    return cleaned[:PR_REVIEW_WATCH_SID_KEY_MAX_LEN] + digest[:PR_REVIEW_WATCH_SID_KEY_SHA1_LEN]
+
+
+def _session_optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _parse_pid(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number if number > 0 else None
+    return None
+
+
+def _session_generation(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _same_live_instance(previous: SessionIndexEntry, ref: SessionRef, proc_started_at: str | None) -> bool:
+    """同一进程才沿用代次。没有可用 PID 时无法证明还是原来的实例。"""
+
+    if _present(previous.ended_at):
+        return False
+    new_pid = _parse_pid(ref.pid)
+    old_pid = previous.pid
+    if new_pid is None or old_pid is None or new_pid != old_pid:
+        return False
+    new_started = _session_optional_text(proc_started_at)
+    old_started = previous.proc_started_at
+    if new_started and old_started and new_started != old_started:
+        return False
+    return True
+
+
+def _next_generation(previous: SessionIndexEntry | None) -> int:
+    if previous is None:
+        return 1
+    current = previous.generation if isinstance(previous.generation, int) else 0
+    if isinstance(current, bool) or current < 1:
+        return 1
+    return current + 1
+
+
+def _parse_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    text = _session_optional_text(value)
+    if text is None:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _coerce_now(now: object) -> datetime:
+    parsed = _parse_time(now)
+    if parsed is None:
+        return datetime.now(timezone.utc)
+    return parsed
+
+
+def _format_time(now: object) -> str:
+    return _coerce_now(now).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _present(value: object) -> bool:
+    return _session_optional_text(value) is not None
+
+
+def _split_session_key(key: str) -> tuple[str, str] | None:
+    if ":" not in key:
+        return None
+    runtime, session_id = key.split(":", 1)
+    if not runtime or not session_id:
+        return None
+    return runtime, session_id
+
+
+def _same_instant(left: str, right: str) -> bool:
+    parsed_left = _parse_time(left)
+    parsed_right = _parse_time(right)
+    if parsed_left is not None and parsed_right is not None:
+        return parsed_left == parsed_right
+    return left.strip() == right.strip()
+
+
+@dataclass
+class SessionRef:
+    runtime: str
+    session_id: str
+    pid: int | None = None
+    workspace: str = ""
+
+    def key(self) -> str:
+        return session_key(self.runtime, self.session_id)
+
+
+@dataclass
+class SessionIndexEntry:
+    runtime: str
+    session_id: str
+    pid: int | None = None
+    proc_started_at: str | None = None
+    workspace: str = ""
+    started_at: str = ""
+    ended_at: str | None = None
+    end_reason: str | None = None
+    last_seen_at: str = ""
+    source: str = ""
+    generation: int = 0
+
+    def key(self) -> str:
+        return session_key(self.runtime, self.session_id)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "procStartedAt": self.proc_started_at,
+            "workspace": self.workspace,
+            "startedAt": self.started_at,
+            "endedAt": self.ended_at,
+            "endReason": self.end_reason,
+            "lastSeenAt": self.last_seen_at,
+            "source": self.source,
+            "generation": self.generation,
+        }
+
+
+@dataclass(frozen=True)
+class SessionEndIdentity:
+    """SessionEnd 入口捕获的实例身份。generation 为 None 时不得当成 0。"""
+
+    runtime: str
+    session_id: str
+    generation: int | None
+    pid: int | None
+    proc_started_at: str | None
+    observed_at: str
+    state: str
+
+    def end_event_key(self) -> str:
+        generation = self.generation if type(self.generation) is int else None
+        pid = self.pid if type(self.pid) is int else None
+        started = self.proc_started_at if isinstance(self.proc_started_at, str) else ""
+        return json.dumps(
+            [self.state, self.runtime, self.session_id, generation, pid, started, self.observed_at],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
+def capture_session_end_identity(
+    index: SessionIndex,
+    runtime: str,
+    session_id: str,
+    now: object,
+) -> SessionEndIdentity:
+    """在遥测之前读一次索引。读失败是 unreadable，没有行是 absent，都不回落最新 marker。"""
+
+    observed = _format_time(now)
+    try:
+        entry = index.get(runtime, session_id)
+    except SessionIndexReadError:
+        return SessionEndIdentity(str(runtime), str(session_id), None, None, None, observed, "unreadable")
+    if entry is None:
+        return SessionEndIdentity(str(runtime), str(session_id), None, None, None, observed, "absent")
+    generation = entry.generation if type(entry.generation) is int else None
+    pid = entry.pid if type(entry.pid) is int else None
+    started = entry.proc_started_at if isinstance(entry.proc_started_at, str) and entry.proc_started_at else None
+    return SessionEndIdentity(str(runtime), str(session_id), generation, pid, started, observed, "known")
+
+
+def session_end_process_contradicts(entry: SessionIndexEntry | None, identity: SessionEndIdentity) -> bool:
+    """两边都有的 pid 或进程启动时间对不上才算矛盾。缺一边不是矛盾。"""
+
+    if entry is None:
+        return False
+    if type(identity.pid) is int and type(entry.pid) is int and identity.pid != entry.pid:
+        return True
+    left = identity.proc_started_at if isinstance(identity.proc_started_at, str) else ""
+    right = entry.proc_started_at if isinstance(entry.proc_started_at, str) else ""
+    return bool(left and right and left != right)
+
+
+def captured_end_verdict(entry: SessionIndexEntry | None, identity: SessionEndIdentity) -> str:
+    """apply 可以写结束标记；reject 原样返回；defer 不写。absent 遇见已有行就是 reject。"""
+
+    state = identity.state
+    if state == "unreadable" or state not in ("known", "absent"):
+        return "defer"
+    if state == "absent":
+        return "apply" if entry is None else "reject"
+    if entry is None:
+        return "apply"
+    if type(identity.generation) is not int or entry.generation != identity.generation:
+        return "reject"
+    if session_end_process_contradicts(entry, identity):
+        return "reject"
+    return "apply"
+
+
+def captured_end_may_deregister(
+    entry: SessionIndexEntry | None,
+    identity: SessionEndIdentity | None,
+    generation: object,
+) -> bool:
+    """注销前的最后一道实例校验。对不上就还没改监听、队列和 inbox。"""
+
+    if entry is None or type(generation) is not int or type(entry.generation) is not int:
+        return False
+    if entry.generation != generation:
+        return False
+    if identity is None:
+        return True
+    if identity.state == "unreadable":
+        return False
+    if identity.state == "known":
+        if type(identity.generation) is not int or identity.generation != generation:
+            return False
+        return not session_end_process_contradicts(entry, identity)
+    if identity.state == "absent":
+        return bool(entry.ended_at)
+    return False
+
+
+def _note_end_outcome(outcome: dict[str, Any] | None, status: str, entry: SessionIndexEntry | None) -> None:
+    if not isinstance(outcome, dict):
+        return
+    outcome["status"] = status
+    generation = entry.generation if entry is not None else None
+    if type(generation) is int:
+        outcome["generation"] = generation
+
+
+@dataclass(frozen=True)
+class ResolvedPid:
+    pid: int | None
+    proc_started_at: str | None
+
+
+@dataclass(frozen=True)
+class LivenessVerdict:
+    state: str
+    basis: str
+    lease_expires_at: str | None
+
+
+def _entry_from_raw(runtime: str, session_id: str, raw: object) -> SessionIndexEntry | None:
+    if not isinstance(raw, dict):
+        return None
+    return SessionIndexEntry(
+        runtime=runtime,
+        session_id=session_id,
+        pid=_parse_pid(raw.get("pid")),
+        proc_started_at=_session_optional_text(raw.get("procStartedAt")),
+        workspace=_session_optional_text(raw.get("workspace")) or "",
+        started_at=_session_optional_text(raw.get("startedAt")) or "",
+        ended_at=_session_optional_text(raw.get("endedAt")),
+        end_reason=_session_optional_text(raw.get("endReason")),
+        last_seen_at=_session_optional_text(raw.get("lastSeenAt")) or "",
+        source=_session_optional_text(raw.get("source")) or "",
+        generation=_session_generation(raw.get("generation")),
+    )
+
+
+def _should_prune(entry: SessionIndexEntry, now: datetime) -> bool:
+    ended = _parse_time(entry.ended_at)
+    if ended is not None and now - ended > _ENDED_PRUNE_AFTER:
+        return True
+    seen = _parse_time(entry.last_seen_at)
+    if seen is not None and now - seen > _SEEN_PRUNE_AFTER:
+        return True
+    return False
+
+
+def _prune_entries(
+    entries: dict[str, SessionIndexEntry], now: datetime
+) -> dict[str, SessionIndexEntry]:
+    return {key: entry for key, entry in entries.items() if not _should_prune(entry, now)}
+
+
+class SessionIndex:
+    """``~/.config/devkit/session-index.json``。读者不加锁；写方法自持 ``session-index.lock``。"""
+
+    def __init__(self, path: Path | None = None, *, home: Path | None = None) -> None:
+        if path is not None:
+            self.path = Path(path)
+        else:
+            base = Path(home).expanduser() if home is not None else Path.home()
+            self.path = base / ".devkit" / DEVKIT_SESSION_INDEX_REL
+        self.lock_path = self.path.parent / DEVKIT_SESSION_INDEX_LOCK_REL
+
+    def record_start(
+        self,
+        ref: SessionRef,
+        proc_started_at: str | None,
+        source: str,
+        now: object,
+        lock_timeout: float | None = None,
+    ) -> SessionIndexEntry | None:
+        try:
+            return self._with_lock(
+                lock_timeout,
+                lambda: self.record_start_locked(ref, proc_started_at, source, now),
+            )
+        except (SessionIndexReadError, OSError):
+            return None
+
+    def record_start_locked(
+        self,
+        ref: SessionRef,
+        proc_started_at: str | None,
+        source: str,
+        now: object,
+    ) -> SessionIndexEntry:
+        now_text = _format_time(now)
+        entries = self._read_entries()
+        key = session_key(ref.runtime, ref.session_id)
+        previous = entries.get(key)
+        same = previous is not None and _same_live_instance(previous, ref, proc_started_at)
+        if same and previous is not None:
+            started_at = previous.started_at or now_text
+            generation = previous.generation if isinstance(previous.generation, int) else 0
+        else:
+            started_at = now_text
+            generation = _next_generation(previous)
+        workspace = ref.workspace
+        if workspace:
+            workspace = normalize_workspace(workspace)
+        entry = SessionIndexEntry(
+            runtime=str(ref.runtime),
+            session_id=str(ref.session_id),
+            pid=_parse_pid(ref.pid),
+            proc_started_at=_session_optional_text(proc_started_at),
+            workspace=workspace or "",
+            started_at=started_at,
+            ended_at=None,
+            end_reason=None,
+            last_seen_at=now_text,
+            source=str(source or ""),
+            generation=generation,
+        )
+        entries[key] = entry
+        self._write_entries(_prune_entries(entries, _coerce_now(now)))
+        return entry
+
+    def record_end(
+        self,
+        runtime: str,
+        session_id: str,
+        reason: str,
+        now: object,
+        lock_timeout: float | None = None,
+        expected_generation: int | None = None,
+        expected_identity: SessionEndIdentity | None = None,
+        outcome: dict[str, Any] | None = None,
+    ) -> SessionIndexEntry | None:
+        try:
+            written = self._with_lock(
+                lock_timeout,
+                lambda: self.record_end_locked(
+                    runtime,
+                    session_id,
+                    reason,
+                    now,
+                    expected_generation,
+                    expected_identity,
+                    outcome,
+                ),
+            )
+        except (SessionIndexReadError, OSError):
+            _note_end_outcome(outcome, "failed", None)
+            return None
+        if written is None and (
+            not isinstance(outcome, dict) or outcome.get("status") not in ("deferred", "rejected")
+        ):
+            _note_end_outcome(outcome, "failed", None)
+        return written
+
+    def record_end_locked(
+        self,
+        runtime: str,
+        session_id: str,
+        reason: str,
+        now: object,
+        expected_generation: int | None = None,
+        expected_identity: SessionEndIdentity | None = None,
+        outcome: dict[str, Any] | None = None,
+    ) -> SessionIndexEntry | None:
+        now_text = _format_time(now)
+        entries = self._read_entries()
+        key = session_key(runtime, session_id)
+        previous = entries.get(key)
+        if expected_identity is not None:
+            verdict = captured_end_verdict(previous, expected_identity)
+            if verdict == "reject":
+                _note_end_outcome(outcome, "rejected", previous)
+                return previous
+            if verdict == "defer":
+                _note_end_outcome(outcome, "deferred", previous)
+                return previous
+            if previous is None:
+                if expected_identity.state == "known":
+                    captured_generation = expected_identity.generation
+                    generation = captured_generation if type(captured_generation) is int and captured_generation >= 1 else 1
+                    pid = expected_identity.pid if type(expected_identity.pid) is int else None
+                    started = expected_identity.proc_started_at
+                    if not isinstance(started, str) or not started:
+                        started = None
+                else:
+                    generation = 1
+                    pid = None
+                    started = None
+                entry = SessionIndexEntry(
+                    runtime=str(runtime),
+                    session_id=str(session_id),
+                    pid=pid,
+                    proc_started_at=started,
+                    workspace="",
+                    started_at=now_text,
+                    ended_at=now_text,
+                    end_reason=None if reason is None else str(reason),
+                    last_seen_at=now_text,
+                    source="session-end",
+                    generation=generation,
+                )
+            else:
+                previous.ended_at = now_text
+                previous.end_reason = None if reason is None else str(reason)
+                previous.last_seen_at = now_text
+                entry = previous
+            entries[key] = entry
+            self._write_entries(_prune_entries(entries, _coerce_now(now)))
+            _note_end_outcome(outcome, "applied", entry)
+            return entry
+        if (
+            previous is not None
+            and isinstance(expected_generation, int)
+            and not isinstance(expected_generation, bool)
+            and previous.generation != expected_generation
+        ):
+            _note_end_outcome(outcome, "rejected", previous)
+            return previous
+        if previous is None:
+            generation = expected_generation if isinstance(expected_generation, int) and expected_generation >= 1 else 1
+            entry = SessionIndexEntry(
+                runtime=str(runtime),
+                session_id=str(session_id),
+                pid=None,
+                proc_started_at=None,
+                workspace="",
+                started_at=now_text,
+                ended_at=now_text,
+                end_reason=None if reason is None else str(reason),
+                last_seen_at=now_text,
+                source="session-end",
+                generation=generation,
+            )
+        else:
+            previous.ended_at = now_text
+            previous.end_reason = None if reason is None else str(reason)
+            previous.last_seen_at = now_text
+            entry = previous
+        entries[key] = entry
+        self._write_entries(_prune_entries(entries, _coerce_now(now)))
+        return entry
+
+    def touch(
+        self,
+        runtime: str,
+        session_id: str,
+        now: object,
+        throttle_seconds: float = 60,
+        lock_timeout: float | None = None,
+    ) -> bool:
+        try:
+            wrote = self._with_lock(
+                lock_timeout,
+                lambda: self.touch_locked(runtime, session_id, now, throttle_seconds),
+            )
+        except (SessionIndexReadError, OSError):
+            return False
+        return bool(wrote)
+
+    def touch_locked(
+        self,
+        runtime: str,
+        session_id: str,
+        now: object,
+        throttle_seconds: float = 60,
+    ) -> bool:
+        """未到节流窗口、会话不存在或已结束时不写。真正写入时才清理过期条目。"""
+        entries = self._read_entries()
+        key = session_key(runtime, session_id)
+        entry = entries.get(key)
+        if entry is None or _present(entry.ended_at):
+            return False
+        now_dt = _coerce_now(now)
+        seen = _parse_time(entry.last_seen_at)
+        window = timedelta(seconds=float(throttle_seconds))
+        if seen is not None and now_dt - seen < window:
+            return False
+        entry.last_seen_at = _format_time(now_dt)
+        entries[key] = entry
+        self._write_entries(_prune_entries(entries, now_dt))
+        return True
+
+    def get(self, runtime: str, session_id: str) -> SessionIndexEntry | None:
+        return self._read_entries().get(session_key(runtime, session_id))
+
+    def find_by_pid(self, runtime: str, pid: object) -> SessionIndexEntry | None:
+        wanted = _parse_pid(pid)
+        if wanted is None:
+            return None
+        matches = [
+            entry
+            for entry in self.live_entries()
+            if entry.runtime == runtime and entry.pid == wanted
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda item: item.last_seen_at, reverse=True)
+        return matches[0]
+
+    def live_entries(self) -> list[SessionIndexEntry]:
+        rows = [entry for entry in self._read_entries().values() if not _present(entry.ended_at)]
+        rows.sort(key=lambda item: (item.last_seen_at, item.key()))
+        return rows
+
+    def prune_locked(self, now: object) -> int:
+        entries = self._read_entries()
+        kept = _prune_entries(entries, _coerce_now(now))
+        removed = len(entries) - len(kept)
+        if removed:
+            self._write_entries(kept)
+        return removed
+
+    def _with_lock(self, lock_timeout: float | None, fn: Callable[[], Any]) -> Any:
+        timeout = _DEFAULT_INDEX_LOCK_TIMEOUT if lock_timeout is None else float(lock_timeout)
+        try:
+            if timeout <= 0:
+                context = locked_path(self.lock_path, blocking=False)
+            else:
+                context = locked_path(self.lock_path, blocking=True, timeout=timeout)
+            with context:
+                return fn()
+        except LockBusy:
+            return None
+
+    def _read_sessions(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise SessionIndexReadError("session index unreadable") from error
+        try:
+            document = json.loads(text)
+        except ValueError as error:
+            raise SessionIndexReadError("session index is not json") from error
+        if not isinstance(document, dict):
+            raise SessionIndexReadError("session index is not an object")
+        sessions = document.get("sessions", {})
+        if not isinstance(sessions, dict):
+            raise SessionIndexReadError("sessions is not an object")
+        return sessions
+
+    def _read_entries(self) -> dict[str, SessionIndexEntry]:
+        entries: dict[str, SessionIndexEntry] = {}
+        for key, raw in self._read_sessions().items():
+            parsed = _split_session_key(str(key))
+            if parsed is None:
+                continue
+            entry = _entry_from_raw(parsed[0], parsed[1], raw)
+            if entry is not None:
+                entries[str(key)] = entry
+        return entries
+
+    def _write_entries(self, entries: Mapping[str, SessionIndexEntry]) -> None:
+        sessions = {key: entries[key].to_json() for key in sorted(entries)}
+        payload = {"schemaVersion": INDEX_SCHEMA_VERSION, "sessions": sessions}
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.path, text)
+
+
+def _lease_seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _lease_expiry(last_seen_at: object, lease_ttl_seconds: object) -> str | None:
+    moment = _parse_time(last_seen_at)
+    ttl = _lease_seconds(lease_ttl_seconds)
+    if moment is None or ttl is None:
+        return None
+    return _format_time(moment + timedelta(seconds=ttl))
+
+
+_DEFAULT_PROCESS_ALIVE = process_alive
+_DEFAULT_PROCESS_START_TIME = process_start_time
+
+
+class LivenessJudge:
+    """唯一存活判定。``process_alive`` / ``process_start_time`` 默认为 textio，测试可注入。"""
+
+    def __init__(
+        self,
+        process_alive: Callable[[int], bool | None] | None = None,
+        process_start_time: Callable[[int], str | None] | None = None,
+    ) -> None:
+        self.process_alive = _DEFAULT_PROCESS_ALIVE if process_alive is None else process_alive
+        self.process_start_time = (
+            _DEFAULT_PROCESS_START_TIME if process_start_time is None else process_start_time
+        )
+
+    def judge(
+        self,
+        entry: SessionIndexEntry | None,
+        now: object,
+        lease_ttl_seconds: object,
+    ) -> LivenessVerdict:
+        if entry is None:
+            return LivenessVerdict("unknown", "no-entry", None)
+        expiry = _lease_expiry(entry.last_seen_at, lease_ttl_seconds)
+        if _present(entry.ended_at):
+            return LivenessVerdict("ended", "ended-marker", expiry)
+        pid = entry.pid if isinstance(entry.pid, int) and entry.pid > 0 else None
+        if pid is not None:
+            alive = self.process_alive(pid)
+            if alive is False:
+                return LivenessVerdict("ended", "pid-dead", expiry)
+            if alive is True:
+                recorded = _session_optional_text(entry.proc_started_at)
+                if recorded is not None:
+                    actual = self.process_start_time(pid)
+                    actual_text = _session_optional_text(actual)
+                    if actual_text is not None and not _same_instant(recorded, actual_text):
+                        return LivenessVerdict("ended", "pid-reused", expiry)
+                return LivenessVerdict("alive", "pid-alive", expiry)
+        return self._lease_verdict(now, expiry)
+
+    def judge_indexed(
+        self,
+        index: SessionIndex,
+        runtime: str,
+        session_id: str,
+        now: object,
+        lease_ttl_seconds: object,
+    ) -> LivenessVerdict:
+        """索引读失败 → unknown。键不存在走 ``judge(None)``，同样是 unknown，basis 不同。"""
+        try:
+            entry = index.get(runtime, session_id)
+        except SessionIndexReadError:
+            return LivenessVerdict("unknown", "index-unreadable", None)
+        return self.judge(entry, now, lease_ttl_seconds)
+
+    def _lease_verdict(self, now: object, expiry: str | None) -> LivenessVerdict:
+        now_dt = _coerce_now(now)
+        expires_at = _parse_time(expiry)
+        if expires_at is None or now_dt >= expires_at:
+            return LivenessVerdict("ended", "lease-expired", expiry)
+        return LivenessVerdict("alive", "lease", expiry)
+
+
+def _chain_rows(
+    current_pid: int | None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None,
+) -> list[tuple[int, int, str]]:
+    chain_fn = parent_chain if parent_chain is not None else parent_pid_chain
+    pid = current_pid if isinstance(current_pid, int) and current_pid > 0 else os.getpid()
+    try:
+        rows = chain_fn(pid, PR_REVIEW_WATCH_PARENT_CHAIN_DEPTH)
+    except Exception:
+        return []
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        return []
+    cleaned: list[tuple[int, int, str]] = []
+    for row in list(rows)[:PR_REVIEW_WATCH_PARENT_CHAIN_DEPTH]:
+        if not isinstance(row, tuple) or len(row) < 3:
+            continue
+        row_pid = row[0]
+        if not isinstance(row_pid, int) or row_pid <= 0:
+            continue
+        cleaned.append((row_pid, row[1] if isinstance(row[1], int) else 0, str(row[2])))
+    return cleaned
+
+
+def _pid_from_chain(
+    runtime: str,
+    current_pid: int | None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None,
+) -> int | None:
+    names = _EXECUTABLES.get(runtime)
+    if not names:
+        return None
+    for row_pid, _ppid, name in _chain_rows(current_pid, parent_chain):
+        if _process_basename(name) in names:
+            return row_pid
+    return None
+
+
+def resolve_runtime_pid(
+    runtime: str,
+    environ: Mapping[str, str] | None = None,
+    *,
+    current_pid: int | None = None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None = None,
+    start_time: Callable[[int], str | None] | None = None,
+) -> ResolvedPid:
+    """claude-code 先读 ``CLAUDE_PID``，否则沿父进程链至多 8 层匹配可执行名。同时取启动时间。"""
+    env = os.environ if environ is None else environ
+    pid: int | None = None
+    if runtime == "claude-code" and isinstance(env, Mapping):
+        pid = _parse_pid(env.get(PR_REVIEW_WATCH_CLAUDE_PID_ENV))
+    if pid is None:
+        pid = _pid_from_chain(runtime, current_pid, parent_chain)
+    if pid is None:
+        return ResolvedPid(None, None)
+    start_fn = start_time if start_time is not None else process_start_time
+    started: str | None = None
+    try:
+        raw_started = start_fn(pid)
+    except Exception:
+        raw_started = None
+    if isinstance(raw_started, str) and raw_started.strip():
+        started = raw_started.strip()
+    return ResolvedPid(pid, started)
+
+
+def _explicit_pair(
+    explicit: object,
+    explicit_runtime: str | None,
+    explicit_session_id: str | None,
+) -> tuple[str, str, str]:
+    runtime: object = explicit_runtime
+    session_id: object = explicit_session_id
+    if explicit is not None:
+        if isinstance(explicit, SessionRef):
+            runtime = explicit.runtime
+            session_id = explicit.session_id
+        elif isinstance(explicit, (tuple, list)) and len(explicit) == 2:
+            runtime = explicit[0]
+            session_id = explicit[1]
+        elif isinstance(explicit, dict):
+            runtime = explicit.get("runtime", runtime)
+            session_id = explicit.get("session_id", explicit.get("sessionId", session_id))
+        else:
+            return "invalid", "", ""
+    runtime_text = runtime.strip() if isinstance(runtime, str) else ""
+    session_text = session_id.strip() if isinstance(session_id, str) else ""
+    if not runtime_text and not session_text:
+        return "absent", "", ""
+    if not runtime_text or not session_text:
+        return "invalid", "", ""
+    return "given", runtime_text, session_text
+
+
+def _env_sessions(environ: Mapping[str, str] | None) -> list[tuple[str, str]]:
+    if not isinstance(environ, Mapping):
+        return []
+    found: list[tuple[str, str]] = []
+    for runtime, variable in PR_REVIEW_WATCH_SESSION_ENV_VARS:
+        value = environ.get(variable)
+        if isinstance(value, str) and value.strip():
+            found.append((runtime, value.strip()))
+    return found
+
+
+def _ref_from_entry(entry: SessionIndexEntry) -> SessionRef:
+    return SessionRef(
+        runtime=entry.runtime,
+        session_id=entry.session_id,
+        pid=entry.pid,
+        workspace=entry.workspace,
+    )
+
+
+def _lookup_entry(
+    index: SessionIndex, runtime: str, session_id: str
+) -> tuple[SessionIndexEntry | None, bool]:
+    try:
+        return index.get(runtime, session_id), False
+    except SessionIndexReadError:
+        return None, True
+
+
+def resolve_current_session(
+    environ: Mapping[str, str] | None = None,
+    explicit: object = None,
+    *,
+    explicit_runtime: str | None = None,
+    explicit_session_id: str | None = None,
+    home: Path | None = None,
+    index: SessionIndex | None = None,
+    current_pid: int | None = None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None = None,
+    start_time: Callable[[int], str | None] | None = None,
+) -> SessionRef | None:
+    """四步解析。失败返回 None，调用方抛 ``PRV-026``。
+
+    claude 子 agent（``CLAUDE_CODE_CHILD_SESSION=1``）的 ``CLAUDE_CODE_SESSION_ID``
+    已是父会话 id，按该 id 登记，不另造子会话。
+    """
+    env = os.environ if environ is None else environ
+    store = index if index is not None else SessionIndex(home=home)
+    kind, runtime, session_id = _explicit_pair(explicit, explicit_runtime, explicit_session_id)
+    if kind == "invalid":
+        return None
+    if kind == "given":
+        if runtime not in _KNOWN_RUNTIMES:
+            return None
+        entry, failed = _lookup_entry(store, runtime, session_id)
+        if failed or entry is None or _present(entry.ended_at):
+            return None
+        return _ref_from_entry(entry)
+
+    found = _env_sessions(env if isinstance(env, Mapping) else None)
+    if len(found) == 1:
+        env_runtime, env_session = found[0]
+        return _ref_from_single_env(
+            store, env_runtime, env_session, env, current_pid, parent_chain, start_time
+        )
+    if len(found) > 1:
+        return _ref_from_nearest_env(
+            store, found, current_pid, parent_chain
+        )
+    return _ref_from_parent_chain(store, current_pid, parent_chain)
+
+
+def _ref_from_single_env(
+    store: SessionIndex,
+    runtime: str,
+    session_id: str,
+    environ: Mapping[str, str],
+    current_pid: int | None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None,
+    start_time: Callable[[int], str | None] | None,
+) -> SessionRef:
+    entry, _failed = _lookup_entry(store, runtime, session_id)
+    if entry is not None and not _present(entry.ended_at) and entry.pid is not None:
+        return _ref_from_entry(entry)
+    resolved = resolve_runtime_pid(
+        runtime,
+        environ,
+        current_pid=current_pid,
+        parent_chain=parent_chain,
+        start_time=start_time,
+    )
+    workspace = entry.workspace if entry is not None else ""
+    return SessionRef(runtime, session_id, resolved.pid, workspace)
+
+
+def _ref_from_nearest_env(
+    store: SessionIndex,
+    found: Sequence[tuple[str, str]],
+    current_pid: int | None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None,
+) -> SessionRef | None:
+    distance: dict[int, int] = {}
+    for index, (row_pid, _ppid, _name) in enumerate(_chain_rows(current_pid, parent_chain)):
+        if row_pid not in distance:
+            distance[row_pid] = index
+    best: SessionIndexEntry | None = None
+    best_distance: int | None = None
+    for runtime, session_id in found:
+        entry, failed = _lookup_entry(store, runtime, session_id)
+        if failed:
+            return None
+        if entry is None or _present(entry.ended_at) or entry.pid is None:
+            continue
+        if entry.pid not in distance:
+            continue
+        candidate = distance[entry.pid]
+        if best_distance is None or candidate < best_distance:
+            best = entry
+            best_distance = candidate
+    if best is None:
+        return None
+    return _ref_from_entry(best)
+
+
+def _ref_from_parent_chain(
+    store: SessionIndex,
+    current_pid: int | None,
+    parent_chain: Callable[..., Sequence[tuple[int, int, str]]] | None,
+) -> SessionRef | None:
+    try:
+        entries = store.live_entries()
+    except SessionIndexReadError:
+        return None
+    by_pid: dict[int, SessionIndexEntry] = {}
+    for entry in entries:
+        if entry.pid is None:
+            continue
+        current = by_pid.get(entry.pid)
+        if current is None or entry.last_seen_at > (current.last_seen_at or ""):
+            by_pid[entry.pid] = entry
+    for row_pid, _ppid, _name in _chain_rows(current_pid, parent_chain):
+        entry = by_pid.get(row_pid)
+        if entry is not None:
+            return _ref_from_entry(entry)
+    return None

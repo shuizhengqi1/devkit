@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import subprocess
@@ -25,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from devkit_flow.session_registry import normalize_workspace
-from devkit_flow.textio import atomic_write_text
+from devkit_flow.textio import _release_platform_lock, atomic_write_text
+from devkit_flow.textio import platform_lock, try_platform_lock, locked_path
 
 BINDINGS_FILE_NAME = "feature-session-bindings.json"
 BINDINGS_LOCK_NAME = "feature-session-bindings.lock"
@@ -146,16 +146,17 @@ def _acquire_lock(lock_path: Path, timeout: float) -> int:
     deadline = time.monotonic() + timeout
     while True:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return descriptor
+            if try_platform_lock(descriptor):
+                return descriptor
         except OSError as exc:
+            # EACCES 在 POSIX 上不一定是竞争，shim 不把它收成 LockBusy；这里维持原轮询。
             if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
                 os.close(descriptor)
                 raise
-            if time.monotonic() >= deadline:
-                os.close(descriptor)
-                raise TimeoutError("session binding lock busy")
-            time.sleep(_LOCK_POLL_SECONDS)
+        if time.monotonic() >= deadline:
+            os.close(descriptor)
+            raise TimeoutError("session binding lock busy")
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 def _workspace_alive(workspace: str) -> bool:
@@ -231,7 +232,7 @@ def record_takeover(workspace: Path, feature: Optional[Dict[str, Any]], *, comma
             atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         finally:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                _release_platform_lock(descriptor)
             finally:
                 os.close(descriptor)
         return None

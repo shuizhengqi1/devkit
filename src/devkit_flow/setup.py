@@ -11,7 +11,7 @@ from devkit_flow.codex_agents import codex_agent_registration_check, codex_user_
 from devkit_flow.config import context_source_summary, format_review_gate_timing_status_text, kba_context_source_doctor, load_config_file, load_review_gate_timing_summary, ones_config_summary, specrules_cache_dir_for_url, validate_specrules_git_url
 from devkit_flow.constants import CONFIG_PATH, AGENT_DATA_PAYLOAD_FILES, DEVKIT_CLI_RELATIVE_PATH, LEGACY_RUNTIME_PLUGIN_NAMES, RUNTIME_PLUGIN_NAME, SPECRULES_CLEANUP_BACKUP_NAME, SPECRULES_CLEANUP_MANUAL, SPECRULES_DISABLED_NO_TREE, SPECRULES_DISABLED_REMOVED, SPECRULES_REFRESH_GIT_TIMEOUT_SECONDS, SPECRULES_REPO_URL, SPECRULES_SETUP_ILLEGAL_REASON, SPECRULES_URL_SWITCH_BACKUP_NAME, TELEMETRY_SSO_IDENTITY_CACHE_RELATIVE_PATH, _SPECRULES_GITMODULES_PATH
 from devkit_flow.e2e import e2e_doctor
-from devkit_flow.errors import DevkitFlowError
+from devkit_flow.errors import DevkitFlowError, PrReviewExit
 from devkit_flow.html_ui import html_ui_doctor
 from devkit_flow.models import SpecrulesResolution, UserStopHookEntry, UserStopHookScan
 from devkit_flow.project_detect import ProfileCache, ProjectDetector, ProjectProfile
@@ -2440,6 +2440,54 @@ class SetupRuleRouting:
         }
 
 
+def _checkout_origin_url(workspace: Path) -> str:
+    """只读 ``.git/config`` 里的 origin URL。没有 remote 时不调用 git，避免兼容沙箱多出事件。"""
+    git_path = workspace / ".git"
+    config_path: Path | None = None
+    if git_path.is_dir():
+        config_path = git_path / "config"
+    elif git_path.is_file():
+        try:
+            gitdir_text = git_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        for raw in gitdir_text.splitlines():
+            stripped = raw.strip()
+            if not stripped.startswith("gitdir:"):
+                continue
+            git_dir = Path(stripped.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = workspace / git_dir
+            config_path = git_dir / "config"
+            break
+    if config_path is None or not config_path.is_file():
+        return ""
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    in_origin = False
+    # git 允许 `[section]` 后写 `;` / `#` 行注释，段头不能要求整行以 `]` 结尾。
+    for raw in lines:
+        stripped = raw.strip()
+        header = re.match(r"^\[(.*?)\]", stripped)
+        if header:
+            in_origin = header.group(1).strip() in {'remote "origin"', "remote 'origin'"}
+            continue
+        if not in_origin or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip().lower() == "url":
+            return value.strip()
+    return ""
+
+
+def _pr_review_repos_action(workspace: Path) -> dict[str, Any] | None:
+    """Public build does not register repositories with a review service."""
+    del workspace
+    return None
+
+
 def command_setup(args: argparse.Namespace) -> int:
     workspace = Path(args.target).expanduser().resolve()
     if workspace.exists() and not workspace.is_dir():
@@ -2582,6 +2630,10 @@ def command_setup(args: argparse.Namespace) -> int:
             )
         )
 
+    repos_action = _pr_review_repos_action(workspace)
+    if repos_action is not None:
+        actions.append(repos_action)
+
     failed = [item for item in actions if item["status"] == "error"]
     counts: dict[str, int] = {}
     for item in actions:
@@ -2691,6 +2743,12 @@ def stale_codex_plugin_finding(config_path: Path | None = None) -> dict[str, Any
 
 
 def _plugin_like_stop_command(command: str) -> bool:
+    """插件自身 session-end 与用户 Stop 段里的同源拷贝。
+
+    DR-25：插件投影命令是 ``--hook-event SessionEnd``。用户若仍把旧插件命令
+    （``--hook-event Stop``）留在 Stop 段，同样含 session-end + ``--hook-json``，
+    也算 plugin_like，不因空 stdout 误诊为第三方 Stop。
+    """
     return "devkit-flow runtime session-end" in command and "--hook-json" in command
 
 
@@ -2867,7 +2925,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     else:
         add("spec-dir", "error", "workspace is not writable; spec/ cannot be created")
 
-    # 全局 CLI 位置与版本：PATH（npm 全局 bin）优先，~/.devkit/bin 兜底，两处都无才 error
+    # 全局 CLI 位置与版本：PATH（npm 全局 bin）优先，~/.config/devkit/bin 兜底，两处都无才 error
     global_cli = find_global_cli()
     if global_cli is not None:
         global_version = extract_embedded_version(global_cli)
@@ -3128,8 +3186,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     add_readonly("rule-binding", lambda: doctor_rule_binding(workspace, detection))
     add_readonly("runtime-lifecycle-transactions", doctor_runtime_transactions)
     add_readonly("version-provenance", lambda: doctor_version_provenance(workspace))
-
-    rank = {"ok": 0, "warn": 1, "error": 2}
+    rank = {"ok": 0, "info": 0, "warn": 1, "error": 2}
     worst = max((rank[check["status"]] for check in checks), default=0)
     overall = {0: "ok", 1: "warn", 2: "error"}[worst]
     lines = [f"doctor: {overall} ({workspace})"]

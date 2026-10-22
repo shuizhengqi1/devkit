@@ -23,6 +23,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "devkit-flow runtime turn-start --runtime claude-code --target \"${PWD}\" --hook-json",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   },
   "modules": ["./register.js"]
